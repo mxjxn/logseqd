@@ -103,6 +103,20 @@
      :embeds     (extract-embeds content')
      :children   []}))
 
+;; ─── Property Line Handling ───────────────────────────────────
+;; Logseq stores block properties as indented `key:: value` lines
+;; that follow the block marker but do NOT use the `- ` prefix.
+;; Example: `\tid:: uuid` is a property of the preceding level-0 block.
+
+(def ^:private uuid-pattern
+  #"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+(defn- property-line? [line]
+  (boolean (re-find #"^\t+[\w/:-]+::\s*" line)))
+
+(defn- extract-block-uuid-from-property [line]
+  (second (re-find (re-pattern (str "^\\t+id::\\s+(" uuid-pattern ")\\s*$")) line)))
+
 ;; ─── Tree Building ────────────────────────────────────────────
 ;; Uses a stack to nest blocks by indentation level.
 
@@ -135,9 +149,41 @@
         lines (str/split-lines content)
         {:keys [frontmatter body]} (parse-frontmatter lines)
         processed (preprocess-code-blocks body)
-        flat-blocks (for [line processed
-                          :when (block-line? line)]
-                      (make-block (strip-block-marker line) (indent-level line)))
+        ;; Process block lines AND property lines.
+        ;; Property lines (key:: value without a leading `- `) at indent-level N
+        ;; belong to the last block we saw at level N-1.
+        flat-blocks (let [result (atom [])
+                          level-to-idx (atom {})]
+                      (doseq [line processed]
+                        (cond
+                          (block-line? line)
+                          (let [level (indent-level line)
+                                block (make-block (strip-block-marker line) level)
+                                idx   (count @result)]
+                            (swap! result conj block)
+                            (swap! level-to-idx assoc level idx))
+
+                          (property-line? line)
+                          (let [prop-level  (indent-level line)
+                                parent-level (dec prop-level)
+                                parent-idx  (get @level-to-idx parent-level)]
+                            (when parent-idx
+                              ;; Extract Logseq block UUID from `id:: <uuid>`
+                              (when-let [uuid (extract-block-uuid-from-property line)]
+                                (swap! result update parent-idx assoc :uuid uuid))
+                              ;; Accumulate ((uuid)) block refs from property values
+                              (let [prop-block-refs (extract-block-refs line)]
+                                (when (seq prop-block-refs)
+                                  (swap! result update parent-idx
+                                         #(update % :block-refs
+                                                  (fn [xs] (vec (concat xs prop-block-refs)))))))
+                              ;; Accumulate [[page]] refs from property values
+                              (let [prop-page-refs (extract-page-refs line)]
+                                (when (seq prop-page-refs)
+                                  (swap! result update parent-idx
+                                         #(update % :refs
+                                                  (fn [xs] (vec (concat xs prop-page-refs)))))))))))
+                      @result)
         block-tree (build-tree flat-blocks)
         ^File f (File. file-path)
         filename (.getName f)

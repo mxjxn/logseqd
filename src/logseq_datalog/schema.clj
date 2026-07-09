@@ -2,6 +2,7 @@
 
 (def schema
   {:block/id        {:db/unique :db.unique/identity}
+   :block/uuid      {:db/unique :db.unique/identity}
    :block/content   {}
    :block/todo      {}
    :block/level     {}

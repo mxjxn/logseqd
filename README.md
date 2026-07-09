@@ -49,6 +49,8 @@ There are existing tools, but none solve the full problem:
     GET  /search?q=keyword
     GET  /pages
     GET  /page/:title
+    GET  /block/:uuid
+    GET  /block/:uuid/refs
     GET  /tags
     POST /query          (Datalog)
     POST /reindex        (full graph)
@@ -78,6 +80,20 @@ GET /search?q=something
 ```
 GET /page/Some%20Page
 ```
+
+**Resolve a block by its Logseq UUID**
+```
+GET /block/668c9f12-3456-7890-abcd-ef1234567890
+```
+Returns the block's content, properties, page, tags, and refs.
+The UUID is the value of the `id::` property that Logseq assigns to each referenced block.
+
+**Find all blocks that reference a UUID**
+```
+GET /block/668c9f12-3456-7890-abcd-ef1234567890/refs
+```
+Returns every block whose content or property values contain `((668c9f12-...))`.
+Useful for reverse graph traversal: given a block, find everything pointing at it.
 
 **Run a Datalog query**
 ```
