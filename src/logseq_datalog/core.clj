@@ -8,12 +8,15 @@
 
 (defn -main
   "Start the headless Logseq Datalog service.
-  Args: [port] [graph-dir]"
+  Args: graph-dir [port]"
   [& args]
-  (let [port      (if (seq args) (Integer/parseInt (first args)) 8471)
-        graph-dir (if (> (count args) 1)
-                    (second args)
-                    "/root/mxjxn-logseq-notes")
+  (when (empty? args)
+    (println "Usage: logseq-datalog <graph-dir> [port]")
+    (System/exit 1))
+  (let [graph-dir (first args)
+        port      (if (> (count args) 1)
+                    (Integer/parseInt (second args))
+                    8471)
         conn      (d/create-conn schema/schema)]
     (println "Logseq Datalog Service")
     (println "──────────────────────")
