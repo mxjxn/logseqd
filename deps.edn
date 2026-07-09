@@ -1,0 +1,7 @@
+{:deps {org.clojure/clojure {:mvn/version "1.11.3"}
+        datascript/datascript {:mvn/version "1.7.3"}
+        ring/ring-core {:mvn/version "1.13.0"}
+        ring/ring-jetty-adapter {:mvn/version "1.13.0"}
+        cheshire/cheshire {:mvn/version "5.13.0"}}
+ :paths ["src"]
+ :aliases {:run {:main-opts ["-m" "logseq-datalog.core"]}}}

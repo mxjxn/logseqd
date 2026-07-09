@@ -1,0 +1,162 @@
+(ns logseq-datalog.indexer
+  (:require [datascript.core :as d]
+            [clojure.string :as str]
+            [logseq-datalog.parser :as parser]
+            [logseq-datalog.schema :as schema])
+  (:import [java.io File]))
+
+;; ─── File Discovery ───────────────────────────────────────────
+
+(defn- find-md-files [dir]
+  (let [f (File. dir)]
+    (if (.isDirectory f)
+      (->> (.listFiles f)
+           (filter #(.isFile %))
+           (filter #(str/ends-with? (.getName %) ".md"))
+           (sort-by #(.getName %)))
+      [])))
+
+;; ─── Recursive Block Walkers ──────────────────────────────────
+
+(defn- walk-blocks
+  "Depth-first walk over block tree, calling (f block) on each.
+  f should return a collection; results are concatenated."
+  [f block]
+  (concat (f block)
+          (mapcat #(walk-blocks f %) (:children block))))
+
+(defn- collect-tags [blocks]
+  (into #{} (mapcat #(walk-blocks :tags %) blocks)))
+
+(defn- collect-refs [blocks]
+  (into #{} (mapcat #(walk-blocks :refs %)) blocks))
+
+;; ─── Transaction Builders ─────────────────────────────────────
+
+(def ^:private tempid-counter (atom 0))
+(def ^:private block-id-counter (atom 0))
+
+(defn- next-tempid []
+  (let [n (swap! tempid-counter inc)]
+    (- n)))
+
+(defn- next-block-id [title]
+  (str title "-" (swap! block-id-counter inc)))
+
+(defn- page->block-tx
+  "Convert a parsed page's block tree into transaction data.
+  Uses negative integer tempids for parent-child links."
+  [{:keys [title blocks]} this-page-eid page-lookup tag-lookup]
+  (let [result (atom [])]
+    (letfn [(process [block parent-tempid order]
+              (let [tid (next-tempid)
+                    bid (next-block-id title)
+                    tag-refs (vec (for [t (:tags block)
+                                        :let [t (str t)]
+                                        :when (tag-lookup (str t))]
+                                   [:tag/name (str t)]))
+                    page-refs (vec (for [r (:refs block)
+                                        :let [r (str r)]
+                                        :when (page-lookup (str r))]
+                                    [:page/title (str r)]))
+                    block-refs-vals (vec (map str (:block-refs block)))
+                    embed-vals (vec (map str (:embeds block)))
+                    tx (cond-> {:db/id        tid
+                                :block/id     bid
+                                :block/content (str (:content block))
+                                :block/level  (:level block)
+                                :block/order  order
+                                :block/page   this-page-eid
+                                :block/source title}
+                         (:todo block)              (assoc :block/todo (name (:todo block)))
+                         parent-tempid              (assoc :block/parent parent-tempid)
+                         (seq tag-refs)             (assoc :block/tags tag-refs)
+                         (seq page-refs)            (assoc :block/refs page-refs)
+                         (seq block-refs-vals)      (assoc :block/block-refs block-refs-vals)
+                         (seq embed-vals)           (assoc :block/embeds embed-vals))]
+                (swap! result conj tx)
+                (doseq [[i child] (map-indexed vector (:children block))]
+                  (process child tid i))))]
+      (doseq [[i block] (map-indexed vector blocks)]
+        (process block nil i))
+      @result)))
+
+;; ─── Main Indexer ─────────────────────────────────────────────
+
+(defn index-graph!
+  "Parse all markdown files and transact into DataScript.
+  Returns {:pages N :blocks N :tags N}."
+  [conn graph-dir]
+  ;; Reset DB and counters
+  (d/reset-conn! conn (d/empty-db schema/schema))
+  (reset! tempid-counter 0)
+  (reset! block-id-counter 0)
+
+  (let [pages-dir (str graph-dir "/pages")
+        journals-dir (str graph-dir "/journals")
+
+        ;; Parse all files (resilient to individual parse errors)
+        parse-or-nil (fn [f journal?]
+                       (try
+                         (parser/parse-file (.getAbsolutePath f) :journal? journal?)
+                         (catch Exception e
+                           (println "  WARN: Error parsing" (.getName f) ":" (.getMessage e))
+                           nil)))
+        parsed-pages (remove nil? (for [f (find-md-files pages-dir)]
+                                    (parse-or-nil f false)))
+        parsed-journals (remove nil? (for [f (find-md-files journals-dir)]
+                                       (parse-or-nil f true)))
+        all-parsed (concat parsed-pages parsed-journals)
+
+        ;; Collect all inline tags from blocks
+        all-tags (into #{}
+                       (mapcat #(collect-tags (:blocks %)))
+                       all-parsed)
+
+        ;; Transact tags, build lookup
+        _ (when (seq all-tags)
+            (d/transact! conn (for [t all-tags] {:tag/name (str t)})))
+        tag-lookup (into {}
+                         (for [[eid name] (d/q '[:find ?e ?name
+                                                  :where [?e :tag/name ?name]] @conn)]
+                           [name eid]))
+
+        ;; Collect all page titles from files
+        file-titles (set (map :title all-parsed))
+
+        ;; Transact page entities
+        _ (d/transact! conn
+                       (for [p all-parsed]
+                         (cond-> {:page/title   (:title p)
+                                  :page/file    (:file p)
+                                  :page/journal (:journal? p)}
+                           (seq (:tags p)) (assoc :page/tags
+                                                  (vec (for [t (:tags p)
+                                                             :let [t (str t)]
+                                                             :when (tag-lookup (str t))]
+                                                         [:tag/name (str t)]))))))
+
+        ;; Create stub pages for referenced-but-not-existing pages
+        all-refs (into #{} (mapcat #(collect-refs (:blocks %))) all-parsed)
+        stub-titles (remove file-titles all-refs)
+        _ (when (seq stub-titles)
+            (d/transact! conn (for [t stub-titles]
+                                {:page/title (str t)})))
+
+        ;; Build page lookup (file pages + stubs)
+        page-lookup (into {}
+                          (for [[eid title] (d/q '[:find ?e ?title
+                                                   :where [?e :page/title ?title]] @conn)]
+                            [title eid]))
+
+        ;; Build and transact all blocks in one shot
+        all-block-tx (mapcat (fn [p]
+                               (page->block-tx p (page-lookup (:title p)) page-lookup tag-lookup))
+                             all-parsed)]
+
+    (when (seq all-block-tx)
+      (d/transact! conn all-block-tx))
+
+    {:pages (count all-parsed)
+     :blocks (count all-block-tx)
+     :tags (count all-tags)}))
