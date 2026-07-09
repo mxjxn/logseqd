@@ -129,4 +129,4 @@ Powers knowledge-graph queries for AI agents — cron jobs write structured data
 
 ## License
 
-Private — mxjxn
+[CC0 1.0 Universal](https://creativecommons.org/publicdomain/zero/1.0/) — public domain, no rights reserved. Do whatever you want with it.
