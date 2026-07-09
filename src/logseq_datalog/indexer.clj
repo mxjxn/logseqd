@@ -106,10 +106,12 @@
         parsed   (parser/parse-file file-path :journal? journal?)
         title    (:title parsed)
 
-        ;; Step 1: Retract existing blocks for this page (keyed by :block/source)
+        ;; Step 1: Retract existing blocks for this page.
+        ;; :block/source stores the page title, so we find blocks whose source
+        ;; matches the current page title.
         existing-block-eids (d/q '[:find [?b ...]
-                                    :in $ ?title
-                                    :where [?b :block/source ?title]]
+                                    :in $ ?source
+                                    :where [?b :block/source ?source]]
                                    @conn title)
         retract-txs (mapv #(vector :db/retractEntity %) existing-block-eids)
 
@@ -118,13 +120,13 @@
 
         ;; Step 3: Transact retractions + new tag upserts + page upsert atomically.
         ;; :page/title has :db.unique/identity so DataScript upserts the page in-place.
+        tag-entry   (fn [t] {:tag/name (str t)})
+        tag-txs     (mapv tag-entry new-tags)
         page-tx (cond-> {:page/title   title
                          :page/file    (:file parsed)
                          :page/journal (:journal? parsed)}
                    (seq (:tags parsed))
-                   (assoc :page/tags
-                          (mapv #(hash-map :tag/name (str %)) (:tags parsed))))
-        tag-txs (mapv #(hash-map :tag/name (str %)) new-tags)
+                   (assoc :page/tags (mapv tag-entry (:tags parsed))))
         _ (d/transact! conn (-> retract-txs (into tag-txs) (conj page-tx)))
 
         ;; Step 4: Build tag lookup after the above transaction
