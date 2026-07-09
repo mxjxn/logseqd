@@ -116,16 +116,9 @@ inotifywait -m -e modify,create,delete,move \
     done
 ```
 
-## Production use
+## Use with AI agents
 
-We run two instances:
-
-| Graph | Port | PM2 process | Watcher |
-|-------|------|-------------|---------|
-| Primary (Max) | 8471 | `logseq-datalog` | `logseq-inotify` |
-| Jeeby's graph | 8472 | `jeeby-logseq-datalog` | `jeeby-logseq-inotify` |
-
-Both are managed by PM2 and survive reboots.
+Powers knowledge-graph queries for AI agents — cron jobs write structured data to a Logseq graph, and agents query it in real-time via the HTTP API. The incremental reindex + inotify pipeline means agents always see fresh data with zero lag.
 
 ## Tech
 
