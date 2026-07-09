@@ -68,6 +68,7 @@
                                 :block/order  order
                                 :block/page   this-page-eid
                                 :block/source title}
+                         (:uuid block)              (assoc :block/uuid (:uuid block))
                          (:todo block)              (assoc :block/todo (name (:todo block)))
                          parent-tempid              (assoc :block/parent parent-tempid)
                          (seq tag-refs)             (assoc :block/tags tag-refs)
