@@ -93,6 +93,17 @@
     (catch Exception e
       (json-resp {:error (.getMessage e)} 500))))
 
+(defn reindex-file-handler [conn graph-dir request]
+  (try
+    (let [body     (read-edn-body request)
+          filename (:file body)]
+      (if-not filename
+        (json-resp {:error "Request body must include :file"} 400)
+        (let [stats (indexer/index-file! conn graph-dir filename)]
+          (json-resp {:status "ok" :stats stats}))))
+    (catch Exception e
+      (json-resp {:error (.getMessage e)} 500))))
+
 ;; ─── Router ───────────────────────────────────────────────────
 
 (defn make-app [conn graph-dir]
@@ -121,6 +132,9 @@
 
           (and (= method :post) (= uri "/reindex"))
           (reindex-handler conn graph-dir request)
+
+          (and (= method :post) (= uri "/reindex-file"))
+          (reindex-file-handler conn graph-dir request)
 
           :else
           {:status  404

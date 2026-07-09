@@ -83,6 +83,78 @@
 
 ;; ─── Main Indexer ─────────────────────────────────────────────
 
+(defn index-file!
+  "Incrementally reindex a single markdown file within the graph.
+  filename is relative to graph-dir (e.g. \"SomePage.md\").
+  Falls back to journals/ if the file is not found in pages/.
+
+  Strategy to avoid DataScript retractEntity/EID-reuse bugs:
+  - Retract existing blocks by :block/source (attribute-level, not page retract)
+  - Upsert the page entity (:page/title has :db.unique/identity)
+  - Use [:page/title title] lookup ref for :block/page so no stale EID is needed
+
+  Returns {:pages 1 :blocks N :tags N}."
+  [conn graph-dir filename]
+  (let [pages-path    (str graph-dir "/pages/" filename)
+        journals-path (str graph-dir "/journals/" filename)
+        file-path (cond
+                    (.exists (File. pages-path))    pages-path
+                    (.exists (File. journals-path)) journals-path
+                    :else (throw (ex-info (str "File not found: " filename)
+                                          {:filename filename})))
+        journal? (str/includes? file-path "/journals/")
+        parsed   (parser/parse-file file-path :journal? journal?)
+        title    (:title parsed)
+
+        ;; Step 1: Retract existing blocks for this page (keyed by :block/source)
+        existing-block-eids (d/q '[:find [?b ...]
+                                    :in $ ?title
+                                    :where [?b :block/source ?title]]
+                                   @conn title)
+        retract-txs (mapv #(vector :db/retractEntity %) existing-block-eids)
+
+        ;; Step 2: Collect inline tags from the freshly-parsed blocks
+        new-tags (collect-tags (:blocks parsed))
+
+        ;; Step 3: Transact retractions + new tag upserts + page upsert atomically.
+        ;; :page/title has :db.unique/identity so DataScript upserts the page in-place.
+        page-tx (cond-> {:page/title   title
+                         :page/file    (:file parsed)
+                         :page/journal (:journal? parsed)}
+                   (seq (:tags parsed))
+                   (assoc :page/tags
+                          (mapv #(hash-map :tag/name (str %)) (:tags parsed))))
+        tag-txs (mapv #(hash-map :tag/name (str %)) new-tags)
+        _ (d/transact! conn (-> retract-txs (into tag-txs) (conj page-tx)))
+
+        ;; Step 4: Build tag lookup after the above transaction
+        tag-lookup (into {}
+                         (d/q '[:find ?name ?e
+                                 :where [?e :tag/name ?name]] @conn))
+
+        ;; Step 5: Ensure stub pages exist for [[...]] references in blocks
+        all-refs    (collect-refs (:blocks parsed))
+        stub-titles (remove #{title} all-refs)
+        _ (when (seq stub-titles)
+            (d/transact! conn (mapv #(hash-map :page/title (str %)) stub-titles)))
+
+        ;; Step 6: Build page lookup (includes stubs created above)
+        page-lookup (into {}
+                          (d/q '[:find ?t ?e
+                                  :where [?e :page/title ?t]] @conn))
+
+        ;; Step 7: Build block transaction data.
+        ;; Use the [:page/title title] lookup ref for :block/page so we never
+        ;; depend on a potentially-stale integer EID from a prior query.
+        block-tx (page->block-tx parsed [:page/title title] page-lookup tag-lookup)]
+
+    (when (seq block-tx)
+      (d/transact! conn block-tx))
+
+    {:pages  1
+     :blocks (count block-tx)
+     :tags   (count new-tags)}))
+
 (defn index-graph!
   "Parse all markdown files and transact into DataScript.
   Returns {:pages N :blocks N :tags N}."
