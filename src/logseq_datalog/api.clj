@@ -158,6 +158,49 @@
             (json-resp {:key k :value v :scope "block"
                         :results blocks :count (count blocks)})))))))
 
+(defn append-handler
+  "POST /append — append a block to a page or today's journal.
+  Body: EDN {:title \"Page\" :content \"text\" :level 0 :journal false}
+  If journal is true, appends to today's YYYY_MM_DD.md journal.
+  If the file doesn't exist, creates it with minimal frontmatter.
+  Writes are sandboxed to the graph's pages/ or journals/ directory."
+  [conn graph-dir request]
+  (try
+    (let [body     (read-edn-body request)
+          title    (:title body)
+          content  (:content body)
+          level    (:level body 0)
+          journal? (boolean (:journal body))]
+      (if (str/blank? content)
+        (json-resp {:error "content is required"} 400)
+        (let [graph-dir-file (java.io.File. graph-dir)
+              today (-> (java.time.LocalDate/now)
+                        (.toString)
+                        (str/replace "-" "_"))
+              filename (if journal?
+                         (str today ".md")
+                         (str (-> (or title "")
+                                  (str/replace #"[/\\:?*\"<>|]" "_"))
+                              ".md"))
+              target-dir (if journal? "journals" "pages")
+              dir-file  (java.io.File. graph-dir-file target-dir)
+              filepath  (java.io.File. dir-file filename)]
+          ;; Create file with minimal frontmatter if it doesn't exist
+          (when-not (.exists filepath)
+            (.mkdirs (.getParentFile filepath))
+            (let [fm-title (if journal? today (or title "Untitled"))]
+              (spit filepath (str "title:: " fm-title "\ntags::\n\n"))))
+          ;; Append the block
+          (let [indent (apply str (repeat level "\t"))
+                block-line (str indent "- " content "\n")]
+            (spit filepath block-line :append true))
+          ;; Reindex this file (index-file! checks both pages/ and journals/)
+          (let [stats (indexer/index-file! conn graph-dir filename)]
+            (json-resp {:status "ok" :file (str target-dir "/" filename)
+                        :stats stats})))))
+    (catch Exception e
+      (json-resp {:error (.getMessage e)} 500))))
+
 (defn reindex-handler [conn graph-dir _]
   (try
     (let [stats (indexer/index-graph! conn graph-dir)]
@@ -236,6 +279,9 @@
 
           (and (= method :get) (= uri "/property"))
           (property-handler conn request)
+
+          (and (= method :post) (= uri "/append"))
+          (append-handler conn graph-dir request)
 
           (and (= method :post) (= uri "/reindex"))
           (reindex-handler conn graph-dir request)
