@@ -97,11 +97,20 @@
       (json-resp {:error "not found" :title title} 404))))
 
 (defn tags-handler [conn _]
-  (let [results (d/q '[:find ?name (count ?b)
-                       :where [?t :tag/name ?name]
-                              [?b :block/tags ?t]] @conn)]
-    (json-resp {:tags (vec (for [[name cnt] results]
-                             {:name name :count cnt}))})))
+  (let [block-tags (d/q '[:find ?name (count ?b)
+                          :where [?t :tag/name ?name]
+                                 [?b :block/tags ?t]] @conn)
+        page-tags  (d/q '[:find ?name (count ?p)
+                          :where [?t :tag/name ?name]
+                                 [?p :page/tags ?t]] @conn)
+        ;; Merge counts (same tag can appear on both blocks and pages)
+        counts (reduce (fn [acc [name cnt]]
+                         (update acc name (fnil + 0) cnt))
+                       {}
+                       (concat block-tags page-tags))
+        tags (vec (for [[name cnt] (sort-by (fn [[_ c]] (- c)) counts)]
+                    {:name name :count cnt}))]
+    (json-resp {:tags tags})))
 
 (defn search-handler [conn request]
   (let [q (get-in request [:params "q"] "")

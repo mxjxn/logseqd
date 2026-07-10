@@ -203,10 +203,14 @@
                                        (parse-or-nil f true)))
         all-parsed (concat parsed-pages parsed-journals)
 
-        ;; Collect all inline tags from blocks
-        all-tags (into #{}
-                       (mapcat #(collect-tags (:blocks %)))
-                       all-parsed)
+        ;; Collect all tags — both inline block tags AND frontmatter tags
+        inline-tags (into #{}
+                          (mapcat #(collect-tags (:blocks %)))
+                          all-parsed)
+        frontmatter-tags (into #{}
+                               (mapcat (fn [p] (map str (:tags p))))
+                               all-parsed)
+        all-tags (into inline-tags frontmatter-tags)
 
         ;; Transact tags, build lookup
         _ (when (seq all-tags)
