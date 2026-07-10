@@ -20,7 +20,22 @@
    :headers {"Content-Type" "application/json"}
    :body    (json/generate-string data)})
 
-;; ─── Handlers ─────────────────────────────────────────────────
+;; ─── Property Helpers ─────────────────────────────────────────
+
+(defn- fold-props
+  "Given a pulled entity map, collect all :prop/<key> attributes into a nested
+  \"properties\" {key value} map and drop the raw :prop/* keys and the
+  *-property-keys enumeration attr. Keeps the output clean for JSON."
+  [m]
+  (let [prop-entries (for [[k v] m
+                           :when (= "prop" (namespace k))]
+                       [(name k) v])]
+    (-> (into {} (remove (fn [[k _]]
+                           (or (= "prop" (namespace k))
+                               (contains? #{:block/property-keys
+                                            :page/property-keys} k)))
+                         m))
+        (cond-> (seq prop-entries) (assoc :properties (into {} prop-entries))))))
 
 (defn query-handler [conn request]
   (try
@@ -42,28 +57,43 @@
     (json-resp {:status "ok" :blocks blocks :pages pages :tags tags})))
 
 (defn pages-handler [conn _]
-  (let [results (d/q '[:find (pull ?p [:page/title :page/journal :page/file])
-                       :where [?p :page/title]] @conn)]
-    (json-resp {:pages (vec results)})))
+  (let [results (d/q '[:find (pull ?p [*])
+                       :where [?p :page/title]] @conn)
+        pages (->> results
+                   (map first)
+                   (map (fn [p]
+                          (-> (fold-props p)
+                              ;; keep the JSON small: drop internal db id
+                              (dissoc :db/id))))
+                   vec)]
+    (json-resp {:pages pages})))
 
 (defn page-handler [conn request]
   (let [raw-title (get-in request [:params "title"])
         title (java.net.URLDecoder/decode raw-title "UTF-8")
-        results (d/q '[:find (pull ?b [:block/content :block/level :block/order
-                                       :block/todo
-                                       {:block/tags   [:tag/name]}
-                                       {:block/refs   [:page/title]}
-                                       {:block/parent [:block/id :block/content]}])
+        page-props (first
+                     (d/q '[:find (pull ?p [*])
+                            :in $ ?title
+                            :where [?p :page/title ?title]]
+                          @conn title))
+        results (d/q '[:find (pull ?b [* {:block/tags   [:tag/name]}
+                                         {:block/refs   [:page/title]}
+                                         {:block/parent [:block/id :block/content]}])
                        :in $ ?title
                        :where [?b :block/page ?p]
                               [?p :page/title ?title]]
                      @conn title)
         blocks (->> results
                     (map first)
+                    (map (fn [b] (-> (fold-props b)
+                                     (dissoc :db/id :block/page :block/source))))
                     (sort-by :block/order)
                     vec)]
     (if (seq blocks)
-      (json-resp {:title title :blocks blocks})
+      (json-resp (cond-> {:title title :blocks blocks}
+                   (some? page-props)
+                   (assoc :page (-> (fold-props (first page-props))
+                                    (dissoc :db/id)))))
       (json-resp {:error "not found" :title title} 404))))
 
 (defn tags-handler [conn _]
@@ -85,6 +115,48 @@
     (json-resp {:query  q
                 :results (vec (map first results))
                 :count   (count results)})))
+
+(defn property-handler
+  "GET /property?key=type&value=job[&scope=block|page]
+  Returns entities that have :prop/<key> = <value>. If value is omitted,
+  returns all entities that have the property key set (any value).
+  scope defaults to \"block\"; use \"page\" for page-level properties."
+  [conn request]
+  (let [k     (get-in request [:params "key"])
+        v     (get-in request [:params "value"])
+        scope (get-in request [:params "scope"] "block")]
+    (if (str/blank? k)
+      (json-resp {:error "key parameter required"} 400)
+      (let [attr (keyword "prop" k)]
+        (if (= scope "page")
+          (let [results (if v
+                          (d/q '[:find (pull ?p [*])
+                                 :in $ ?attr ?v
+                                 :where [?p ?attr ?v] [?p :page/title]]
+                               @conn attr v)
+                          (d/q '[:find (pull ?p [*])
+                                 :in $ ?attr
+                                 :where [?p ?attr _] [?p :page/title]]
+                               @conn attr))
+                pages (->> results (map first)
+                           (map #(-> (fold-props %) (dissoc :db/id))) vec)]
+            (json-resp {:key k :value v :scope "page"
+                        :results pages :count (count pages)}))
+          (let [results (if v
+                          (d/q '[:find (pull ?b [* {:block/page [:page/title]}
+                                                   {:block/tags [:tag/name]}])
+                                 :in $ ?attr ?v
+                                 :where [?b ?attr ?v] [?b :block/content]]
+                               @conn attr v)
+                          (d/q '[:find (pull ?b [* {:block/page [:page/title]}
+                                                   {:block/tags [:tag/name]}])
+                                 :in $ ?attr
+                                 :where [?b ?attr _] [?b :block/content]]
+                               @conn attr))
+                blocks (->> results (map first)
+                            (map #(-> (fold-props %) (dissoc :db/id :block/source))) vec)]
+            (json-resp {:key k :value v :scope "block"
+                        :results blocks :count (count blocks)})))))))
 
 (defn reindex-handler [conn graph-dir _]
   (try
@@ -161,6 +233,9 @@
 
           (and (= method :get) (= uri "/search"))
           (search-handler conn request)
+
+          (and (= method :get) (= uri "/property"))
+          (property-handler conn request)
 
           (and (= method :post) (= uri "/reindex"))
           (reindex-handler conn graph-dir request)

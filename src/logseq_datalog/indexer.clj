@@ -43,6 +43,21 @@
 (defn- next-block-id [title]
   (str title "-" (swap! block-id-counter inc)))
 
+(defn- prop-attr
+  "Dynamic DataScript attribute for a property key, e.g. \"type\" -> :prop/type."
+  [k]
+  (keyword "prop" (str k)))
+
+(defn- props->tx
+  "Turn a {key value} property map into a partial tx map of dynamic
+  :prop/<key> attributes plus a :block/property-keys (or :page/property-keys)
+  list of the key names for enumeration."
+  [props keys-attr]
+  (when (seq props)
+    (into {keys-attr (vec (keys props))}
+          (for [[k v] props]
+            [(prop-attr k) (str v)]))))
+
 (defn- page->block-tx
   "Convert a parsed page's block tree into transaction data.
   Uses negative integer tempids for parent-child links."
@@ -61,6 +76,7 @@
                                     [:page/title (str r)]))
                     block-refs-vals (vec (map str (:block-refs block)))
                     embed-vals (vec (map str (:embeds block)))
+                    prop-tx (props->tx (:properties block) :block/property-keys)
                     tx (cond-> {:db/id        tid
                                 :block/id     bid
                                 :block/content (str (:content block))
@@ -74,7 +90,8 @@
                          (seq tag-refs)             (assoc :block/tags tag-refs)
                          (seq page-refs)            (assoc :block/refs page-refs)
                          (seq block-refs-vals)      (assoc :block/block-refs block-refs-vals)
-                         (seq embed-vals)           (assoc :block/embeds embed-vals))]
+                         (seq embed-vals)           (assoc :block/embeds embed-vals)
+                         prop-tx                    (merge prop-tx))]
                 (swap! result conj tx)
                 (doseq [[i child] (map-indexed vector (:children block))]
                   (process child tid i))))]
@@ -127,7 +144,10 @@
                          :page/file    (:file parsed)
                          :page/journal (:journal? parsed)}
                    (seq (:tags parsed))
-                   (assoc :page/tags (mapv tag-entry (:tags parsed))))
+                   (assoc :page/tags (mapv tag-entry (:tags parsed)))
+
+                   (seq (:properties parsed))
+                   (merge (props->tx (:properties parsed) :page/property-keys)))
         _ (d/transact! conn (-> retract-txs (into tag-txs) (conj page-tx)))
 
         ;; Step 4: Build tag lookup after the above transaction
@@ -209,7 +229,10 @@
                                                   (vec (for [t (:tags p)
                                                              :let [t (str t)]
                                                              :when (tag-lookup (str t))]
-                                                         [:tag/name (str t)]))))))
+                                                         [:tag/name (str t)])))
+
+                           (seq (:properties p))
+                           (merge (props->tx (:properties p) :page/property-keys)))))
 
         ;; Create stub pages for referenced-but-not-existing pages
         all-refs (into #{} (mapcat #(collect-refs (:blocks %))) all-parsed)
