@@ -496,10 +496,10 @@
                                       :block-id  block-id
                                       :new-level new-level
                                       :page      page-title
-                                      :file      (str target-dir "/" filename)})))))))))  ;; close if-let true branch
-            (json-resp {:error "block not found" :block-id block-id} 404)))))  ;; close if-let false, result-let, cond, outer-let, try
+                                      :file      (str target-dir "/" filename)}))))))))
+            (json-resp {:error "block not found" :block-id block-id} 404)))))
     (catch Exception e
-      (json-resp {:error (.getMessage e)} 500))))  ;; close catch, close try
+      (json-resp {:error (.getMessage e)} 500))))
 
 (defn reindex-handler [conn graph-dir _]
   (try
