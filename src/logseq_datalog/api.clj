@@ -311,6 +311,196 @@
     (catch Exception e
       (json-resp {:error (.getMessage e)} 500))))
 
+(defn- find-block-line-index
+  "Find the line index of a block in the file lines vector.
+  Uses exact content match first, then bullet-line counting at target level."
+  [lines level order old-content]
+  (let [indent (apply str (repeat level "\t"))
+        exact-match (when old-content
+                      (first (keep-indexed
+                               (fn [i line]
+                                 (when (= line (str indent "- " old-content))
+                                   i))
+                               lines)))
+        order-match (when-not exact-match
+                      (let [bullet-idx (atom -1)]
+                        (first (keep-indexed
+                                 (fn [i line]
+                                   (let [line-level (count (take-while #(= % "\t") line))]
+                                     (when (and (= line-level level)
+                                                (re-find #"^\t*- " line))
+                                       (swap! bullet-idx inc)
+                                       (when (= @bullet-idx order) i))))
+                                 lines))))]
+    (or exact-match order-match)))
+
+(defn- skip-children
+  "Starting from the line after idx, skip forward past all lines whose indent
+  level is strictly greater than target-level. Returns the index after the
+  last child (or idx+1 if no children follow)."
+  [lines idx target-level]
+  (loop [i (inc idx)]
+    (if (>= i (count lines))
+      i
+      (let [line-level (count (take-while #(= % "\t") (nth lines i)))]
+        (if (> line-level target-level)
+          (recur (inc i))
+          i)))))
+
+(defn insert-block-handler
+  "POST /insert-block — insert a new block after an existing block.
+   Body: EDN {:page \"Page Title\" :content \"new block text\" :level 1 :after-block-id \"Page-7\"}
+   :after-block-id, :page, and :content are all required."
+  [conn graph-dir request]
+  (try
+    (let [body         (read-edn-body request)
+          after-id     (:after-block-id body)
+          page         (:page body)
+          content      (:content body)
+          level        (:level body 1)]
+      (cond
+        (str/blank? after-id)
+        (json-resp {:error "after-block-id is required"} 400)
+
+        (str/blank? page)
+        (json-resp {:error "page is required"} 400)
+
+        (str/blank? content)
+        (json-resp {:error "content is required"} 400)
+
+        :else
+        (let [result (d/q '[:find (pull ?b [:block/content
+                                             :block/level
+                                             :block/order
+                                             {:block/page [:page/title]}])
+                           :in $ ?bid
+                           :where [?b :block/id ?bid]]
+                         @conn after-id)]
+          (if-let [block (ffirst result)]
+            (let [page-title  (-> block :block/page :page/title)
+                  block-level (:block/level block)
+                  order       (:block/order block)
+                  old-content (:block/content block)]
+              (if (str/blank? page-title)
+                (json-resp {:error "block has no associated page"} 404)
+                (let [graph-dir-file (java.io.File. graph-dir)
+                      is-journal?   (re-matches #"\d{4}_\d{2}_\d{2}" page-title)
+                      target-dir    (if is-journal? "journals" "pages")
+                      filename      (str (str/replace page-title #"[\"/\\:?*<>|]" "_") ".md")
+                      filepath      (java.io.File. (java.io.File. graph-dir-file target-dir) filename)]
+                  (if-not (.exists filepath)
+                    (json-resp {:error "source file not found"
+                                :file (str target-dir "/" filename)} 404)
+                    (let [lines      (str/split-lines (slurp filepath))
+                          idx        (find-block-line-index lines block-level order old-content)]
+                      (if (nil? idx)
+                        (json-resp {:error "could not locate block in file"
+                                    :block-id after-id :order order :level block-level} 404)
+                        (let [insert-pos (skip-children lines idx block-level)
+                              new-indent (apply str (repeat level "\t"))
+                              new-line   (str new-indent "- " content)
+                              new-lines  (vec (concat (subvec lines 0 insert-pos)
+                                                      [new-line]
+                                                      (subvec lines insert-pos)))]
+                          (spit filepath (str/join "\n" new-lines))
+                          (indexer/index-file! conn graph-dir filename)
+                          (let [new-order (inc order)
+                                new-result (d/q '[:find (pull ?b [:block/id])
+                                                 :in $ ?pt ?ord ?lvl
+                                                 :where [?b :block/id ?bid]
+                                                        [?b :block/order ?ord]
+                                                        [?b :block/level ?lvl]
+                                                        [?p :page/title ?pt]
+                                                        [?b :block/page ?p]]
+                                                @conn page-title new-order level)
+                                new-bid (-> new-result ffirst :block/id)]
+                            (json-resp {:status "ok"
+                                        :block-id new-bid
+                                        :after-block-id after-id
+                                        :page page-title
+                                        :file (str target-dir "/" filename)})))))))))
+            (json-resp {:error "block not found" :block-id after-id} 404)))))
+    (catch Exception e
+      (json-resp {:error (.getMessage e)} 500))))
+
+(defn change-block-level-handler
+  "POST /change-block-level — change a block's indentation level in the markdown file,
+   moving the entire subtree (children included).
+   Body: EDN {:block-id \"Page-7\" :new-level 2}
+   When indenting (new-level > current-level): adds tabs to block + all children.
+   When outdenting (new-level < current-level): removes tabs, clamping children to new-level+1."
+  [conn graph-dir request]
+  (try
+    (let [body      (read-edn-body request)
+          block-id  (:block-id body)
+          new-level (:new-level body)]
+      (cond
+        (str/blank? block-id)
+        (json-resp {:error "block-id is required"} 400)
+
+        (nil? new-level)
+        (json-resp {:error "new-level is required"} 400)
+
+        (< new-level 0)
+        (json-resp {:error "new-level must be >= 0"} 400)
+
+        :else
+        (let [result (d/q '[:find (pull ?b [:block/content
+                                            :block/level
+                                            :block/order
+                                            {:block/page [:page/title]}])
+                           :in $ ?bid
+                           :where [?b :block/id ?bid]]
+                         @conn block-id)]
+          (if-let [block (ffirst result)]
+            (let [page-title  (-> block :block/page :page/title)
+                  cur-level   (:block/level block)
+                  order       (:block/order block)
+                  old-content (:block/content block)]
+              (if (str/blank? page-title)
+                (json-resp {:error "block has no associated page"} 404)
+                (let [graph-dir-file (java.io.File. graph-dir)
+                      is-journal?   (re-matches #"\d{4}_\d{2}_\d{2}" page-title)
+                      target-dir    (if is-journal? "journals" "pages")
+                      filename      (str (str/replace page-title #"[\"/\\:?*<>|]" "_") ".md")
+                      filepath      (java.io.File. (java.io.File. graph-dir-file target-dir) filename)]
+                  (if-not (.exists filepath)
+                    (json-resp {:error "source file not found"
+                                :file (str target-dir "/" filename)} 404)
+                    (let [lines (str/split-lines (slurp filepath))
+                          idx   (find-block-line-index lines cur-level order old-content)]
+                      (if (nil? idx)
+                        (json-resp {:error "could not locate block in file"
+                                    :block-id block-id :order order :level cur-level} 404)
+                        (let [end-idx (skip-children lines idx cur-level)
+                              delta   (- new-level cur-level)
+                              subtree (subvec lines idx end-idx)
+                              changed-sub (mapv (fn [line]
+                                                  (let [line-level (count (take-while #(= % \tab) line))
+                                                        rest-part  (subs line line-level)]
+                                                    (cond
+                                                      (zero? line-level) line
+                                                      (= line-level cur-level)
+                                                      (str (apply str (repeat new-level \tab)) rest-part)
+                                                      :else
+                                                      (let [new-lvl (max (+ new-level 1)
+                                                                        (+ line-level delta))]
+                                                        (str (apply str (repeat new-lvl \tab)) rest-part)))))
+                                                subtree)
+                              new-lines (vec (concat (subvec lines 0 idx)
+                                                      changed-sub
+                                                      (subvec lines end-idx)))]
+                          (spit filepath (str/join "\n" new-lines))
+                          (indexer/index-file! conn graph-dir filename)
+                          (json-resp {:status    "ok"
+                                      :block-id  block-id
+                                      :new-level new-level
+                                      :page      page-title
+                                      :file      (str target-dir "/" filename)})))))))))  ;; close if-let true branch
+            (json-resp {:error "block not found" :block-id block-id} 404)))))  ;; close if-let false, result-let, cond, outer-let, try
+    (catch Exception e
+      (json-resp {:error (.getMessage e)} 500))))  ;; close catch, close try
+
 (defn reindex-handler [conn graph-dir _]
   (try
     (let [stats (indexer/index-graph! conn graph-dir)]
@@ -435,6 +625,12 @@
 
           (and (= method :post) (= uri "/update-block"))
           (update-block-handler conn graph-dir request)
+
+          (and (= method :post) (= uri "/insert-block"))
+          (insert-block-handler conn graph-dir request)
+
+          (and (= method :post) (= uri "/change-block-level"))
+          (change-block-level-handler conn graph-dir request)
 
           (and (= method :post) (= uri "/reindex"))
           (reindex-handler conn graph-dir request)
