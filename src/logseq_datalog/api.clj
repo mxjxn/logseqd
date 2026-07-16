@@ -205,6 +205,12 @@
             (.mkdirs (.getParentFile filepath))
             (let [fm-title (if journal? today (or title "Untitled"))]
               (spit filepath (str "title:: " fm-title "\ntags::\n\n"))))
+          ;; Ensure file ends with newline before appending
+          (when (and (.exists filepath) (.length filepath) > 0)
+            (let [fcontent (slurp filepath)]
+              (when (and (not (str/blank? fcontent))
+                         (not (str/ends-with? fcontent "\n")))
+                (spit filepath "\n" :append true))))
           ;; Append the block
           (let [indent (apply str (repeat level "\t"))
                 block-line (str indent "- " content "\n")]
