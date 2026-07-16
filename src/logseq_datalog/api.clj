@@ -326,7 +326,7 @@
                       (let [bullet-idx (atom -1)]
                         (first (keep-indexed
                                  (fn [i line]
-                                   (let [line-level (count (take-while #(= % "\t") line))]
+                                   (let [line-level (count (take-while #(= % \tab) line))]
                                      (when (and (= line-level level)
                                                 (re-find #"^\t*- " line))
                                        (swap! bullet-idx inc)
@@ -336,16 +336,25 @@
 
 (defn- skip-children
   "Starting from the line after idx, skip forward past all lines whose indent
-  level is strictly greater than target-level. Returns the index after the
-  last child (or idx+1 if no children follow)."
+   level is strictly greater than target-level, or lines that don't start with
+   a bullet (continuation/property lines belonging to a child block).
+   Returns the index after the last child (or idx+1 if no children follow)."
   [lines idx target-level]
   (loop [i (inc idx)]
     (if (>= i (count lines))
       i
-      (let [line-level (count (take-while #(= % "\t") (nth lines i)))]
-        (if (> line-level target-level)
+      (let [line       (nth lines i)
+            line-level (count (take-while #(= % \tab) line))
+            has-bullet (re-find #"^\t*- " line)]
+        (cond
+          ;; strictly deeper indent — part of subtree
+          (> line-level target-level)
           (recur (inc i))
-          i)))))
+          ;; same tab-level or shallower but no bullet — continuation/property
+          ;; line belonging to the last child block
+          (and (<= line-level target-level) (not has-bullet) (not (str/blank? line)))
+          (recur (inc i))
+          :else i)))))
 
 (defn insert-block-handler
   "POST /insert-block — insert a new block after an existing block.
@@ -477,11 +486,19 @@
                               subtree (subvec lines idx end-idx)
                               changed-sub (mapv (fn [line]
                                                   (let [line-level (count (take-while #(= % \tab) line))
+                                                        has-bullet (re-find #"^\t*- " line)
                                                         rest-part  (subs line line-level)]
                                                     (cond
-                                                      (zero? line-level) line
+                                                      ;; no bullet and not blank — property/continuation line,
+                                                      ;; stays with its block (delta applies relative to parent)
+                                                      (and (zero? line-level) (not has-bullet) (not (str/blank? line)))
+                                                      (str (apply str (repeat new-level \tab)) rest-part)
+                                                      ;; blank line — leave alone
+                                                      (str/blank? line) line
+                                                      ;; the parent block itself — set to new level
                                                       (= line-level cur-level)
                                                       (str (apply str (repeat new-level \tab)) rest-part)
+                                                      ;; child block — adjust by delta
                                                       :else
                                                       (let [new-lvl (max (+ new-level 1)
                                                                         (+ line-level delta))]
