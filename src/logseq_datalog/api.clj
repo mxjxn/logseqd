@@ -7,6 +7,48 @@
             [logseq-datalog.indexer :as indexer])
   (:import [java.io PushbackReader InputStreamReader File]))
 
+;; ─── Index Dedup (mtime-based) ────────────────────────────────
+;; Write handlers (append, update-block, insert-block, change-block-level)
+;; modify the .md file then immediately call index-file!. The inotify watcher
+;; detects that write ~0.5s later and calls /reindex-file, which would reindex
+;; the same (unchanged) file — burning through block IDs and making every ID
+;; in the frontend stale.
+;;
+;; Strategy: record the file's mtime AFTER indexing. When the inotify-triggered
+;; reindex arrives, compare the current mtime to the recorded one. If they
+;; match, the file hasn't been touched since the handler indexed it → skip.
+;; If the mtime is newer, a genuine external edit happened → reindex.
+
+(def ^:private indexed-mtimes (atom {}))
+
+(defn- resolve-file-path [graph-dir filename]
+  "Find the actual path for a file, checking pages/ and journals/."
+  (let [graph-dir-file (java.io.File. graph-dir)
+        pages-dir     (java.io.File. graph-dir-file "pages")
+        journals-dir  (java.io.File. graph-dir-file "journals")
+        pages-cand    (java.io.File. pages-dir filename)
+        journals-cand (java.io.File. journals-dir filename)]
+    (cond
+      (.exists pages-cand)   pages-cand
+      (.exists journals-cand) journals-cand
+      :else nil)))
+
+(defn- index-and-record! [conn graph-dir filename]
+  "Index a file and record its mtime so the inotify-triggered
+   reindex-file-handler can detect whether the file changed since."
+  (let [stats   (indexer/index-file! conn graph-dir filename)
+        path    (resolve-file-path graph-dir filename)
+        mtime   (when path (.lastModified path))]
+    (when mtime (swap! indexed-mtimes assoc filename mtime))
+    stats))
+
+(defn- unchanged-since-index? [graph-dir filename]
+  "True if the file exists and its mtime matches the last handler-indexed
+   mtime (meaning the handler already indexed this exact content)."
+  (when-let [recorded-mtime (get @indexed-mtimes filename)]
+    (when-let [path (resolve-file-path graph-dir filename)]
+      (= recorded-mtime (.lastModified path)))))
+
 ;; ─── Helpers ──────────────────────────────────────────────────
 
 (defn- read-edn-body [request]
@@ -131,6 +173,89 @@
                 :results (vec (map first results))
                 :count   (count results)})))
 
+;; ─── Templates ────────────────────────────────────────────────
+
+(def ^:private templates-cache
+  (atom {:data nil :timestamp 0}))
+
+(def ^:private templates-cache-ttl-ms (* 5 60 1000))
+
+(defn- templates-cache-valid? []
+  (let [{:keys [data timestamp]} @templates-cache]
+    (and (some? data)
+         (pos? timestamp)
+         (< (- (System/currentTimeMillis) timestamp) templates-cache-ttl-ms))))
+
+(defn- extract-template-name
+  "Pull the value after 'template::' in a block's content.
+   Only matches blocks where template:: appears as a property (after bullet marker),
+   not in prose. Captures only the template name — stops at whitespace, backtick, or newline."
+  [content]
+  (when content
+    (let [cleaned (str/trim content)]
+      ;; Match: optional bullet, then template:: <name>
+      ;; e.g. "- template:: morning-journal" or "template:: morning-journal"
+      (some-> (re-find #"^[*-]?\s*template::\s*([^\s`\n]+)" cleaned)
+              second
+              str/trim))))
+
+(defn- collect-template-children
+  "Given a page's blocks (sorted by :block/order) and the index of the template
+  block, collect the contents of subsequent blocks at strictly higher
+  :block/level, stopping when the level returns to the same or lower."
+  [blocks idx]
+  (let [base-level (get-in blocks [idx :block/level])]
+    (loop [i   (inc idx)
+           acc []]
+      (if (>= i (count blocks))
+        acc
+        (let [blk (:block/level (nth blocks i))]
+          (if (> blk base-level)
+            (recur (inc i)
+                   (conj acc (str "- " (:block/content (nth blocks i)))))
+            acc))))))
+
+(defn- build-templates
+  "Query DataScript for all blocks whose content contains 'template::' and
+   assemble each into {:name :page :children} with child blocks walked by
+   :block/level + :block/order within the same page."
+  [conn]
+  (let [all-blocks (vec
+                     (d/q '[:find (pull ?b [:block/content :block/level :block/order
+                                          {:block/page [:page/title]}])
+                             :where [?b :block/content]]
+                           @conn))
+        by-page (group-by #(get-in % [:block/page :page/title]) (mapv first all-blocks))
+        templates (atom [])]
+    (doseq [page-title (keys by-page)]
+      (let [page-blocks (sort-by :block/order (vec (get by-page page-title)))]
+        (doseq [i (range (count page-blocks))]
+          (let [block (nth page-blocks i nil)]
+            (when block
+              (let [content (:block/content block)
+                    tmpl-name (extract-template-name content)]
+                (when tmpl-name
+                  (let [base-level (:block/level block)
+                        children (loop [j (inc i) acc []]
+                                   (if (>= j (count page-blocks))
+                                     acc
+                                     (let [child (nth page-blocks j)]
+                                       (if (> (:block/level child) base-level)
+                                         (recur (inc j) (conj acc (str "- " (:block/content child))))
+                                         acc))))]
+                    (swap! templates conj {:name tmpl-name :page page-title :children children})))))))))
+    @templates))
+
+(defn templates-handler
+  "GET /templates — list all blocks defining a 'template::' property.
+   Result is cached in an atom for 5 minutes (templates-cache-ttl-ms)."
+  [conn _]
+  (if (templates-cache-valid?)
+    (json-resp {:templates (:data @templates-cache)})
+    (let [templates (build-templates conn)]
+      (swap! templates-cache assoc :data templates :timestamp (System/currentTimeMillis))
+      (json-resp {:templates templates}))))
+
 (defn property-handler
   "GET /property?key=type&value=job[&scope=block|page]
   Returns entities that have :prop/<key> = <value>. If value is omitted,
@@ -216,7 +341,7 @@
                 block-line (str indent "- " content "\n")]
             (spit filepath block-line :append true))
           ;; Reindex this file (index-file! checks both pages/ and journals/)
-          (let [stats (indexer/index-file! conn graph-dir filename)]
+          (let [stats (index-and-record! conn graph-dir filename)]
             (json-resp {:status "ok" :file (str target-dir "/" filename)
                         :stats stats})))))
     (catch Exception e
@@ -296,7 +421,7 @@
                                                       [new-line]
                                                       (subvec lines (inc idx))))]
                           (spit filepath (str/join "\n" new-lines))
-                          (indexer/index-file! conn graph-dir filename)
+                          (index-and-record! conn graph-dir filename)
                           ;; block-id counter increments on reindex, so fetch the new id
                           (let [new-result (d/q '[:find (pull ?b [:block/id])
                                                :in $ ?pt ?ord ?lvl
@@ -418,7 +543,7 @@
                                                       [new-line]
                                                       (subvec lines insert-pos)))]
                           (spit filepath (str/join "\n" new-lines))
-                          (indexer/index-file! conn graph-dir filename)
+                          (index-and-record! conn graph-dir filename)
                           (let [new-order (inc order)
                                 new-result (d/q '[:find (pull ?b [:block/id])
                                                  :in $ ?pt ?ord ?lvl
@@ -514,7 +639,7 @@
                                                       changed-sub
                                                       (subvec lines end-idx)))]
                           (spit filepath (str/join "\n" new-lines))
-                          (indexer/index-file! conn graph-dir filename)
+                          (index-and-record! conn graph-dir filename)
                           (json-resp {:status    "ok"
                                       :block-id  block-id
                                       :new-level new-level
@@ -535,8 +660,17 @@
   (try
     (let [body     (read-edn-body request)
           filename (:file body)]
-      (if-not filename
+      (cond
+        (str/blank? filename)
         (json-resp {:error "Request body must include :file"} 400)
+
+        ;; Skip if a write handler already indexed this exact file content
+        ;; (matching mtime = file hasn't changed since the handler wrote+indexed it).
+        ;; External edits produce a newer mtime and reindex normally.
+        (unchanged-since-index? graph-dir filename)
+        (json-resp {:status "skipped" :reason "already indexed at current mtime"})
+
+        :else
         (let [stats (indexer/index-file! conn graph-dir filename)]
           (json-resp {:status "ok" :stats stats}))))
     (catch Exception e
@@ -642,6 +776,9 @@
 
           (and (= method :get) (= uri "/property"))
           (property-handler conn request)
+
+          (and (= method :get) (= uri "/templates"))
+          (templates-handler conn request)
 
           (and (= method :post) (= uri "/append"))
           (append-handler conn graph-dir request)
