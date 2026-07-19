@@ -350,7 +350,7 @@
 (defn update-block-handler
   "POST /update-block — replace the content of an existing block.
    Body: EDN {:id \"block-id\" :content \"new content\"}
-   block-id format: \"PageTitle-Counter\" (e.g. \"Mnemosyne-1\")
+   block-id format: \"PageTitle-Counter\" (e.g. \"MyPage-1\")
    Looks up block in DataScript by id to get page title, order, level,
    then finds the line in the .md file by counting bullet positions."
   [conn graph-dir request]
