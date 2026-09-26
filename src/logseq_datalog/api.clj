@@ -5,7 +5,8 @@
             [cheshire.core :as json]
             [ring.middleware.params :as params]
             [logseq-datalog.indexer :as indexer])
-  (:import [java.io PushbackReader InputStreamReader File]))
+  (:import [java.io PushbackReader InputStreamReader File]
+         [java.util UUID]))
 
 ;; ─── Index Dedup (mtime-based) ────────────────────────────────
 ;; Write handlers (append, update-block, insert-block, change-block-level)
@@ -162,15 +163,39 @@
 
 (defn search-handler [conn request]
   (let [q (get-in request [:params "q"] "")
+        ;; Search block content, but exclude journals (title matches \d{4}_\d{2}_\d{2})
+        ;; and pages with private:: true
         results (d/q '[:find (pull ?b [:block/content
-                                       {:block/page [:page/title]}
-                                       {:block/tags [:tag/name]}])
+                                       {:block/page [:page/title]}])
                        :in $ ?search
                        :where [?b :block/content ?content]
-                              [(clojure.string/includes? ?content ?search)]]
-                     @conn q)]
-    (json-resp {:query  q
-                :results (vec (map first results))
+                              [(clojure.string/includes? ?content ?search)]
+                              [?b :block/page ?p]
+                              [?p :page/title ?title]
+                              (not [(re-matches #"(?i)^\d{4}[-_]\d{2}[-_]\d{2}(.*)?" ?title)])
+                              (not [(re-matches #"(?i)^TODAY - " ?title)])
+                              (not [(re-matches #"(?i)^[A-Z][a-z]{2} \d{1,2}(?:st|nd|rd|th), \d{4}" ?title)])
+                              (not [?p :prop/private "true"])]
+                     @conn q)
+        ;; Deduplicate: group by page, take first 3 blocks per page
+        by-page (reduce (fn [acc item]
+                           (let [page-title (get-in item [:block/page :page/title] "unknown")
+                                 content (:block/content item)]
+                             (update acc page-title
+                                     (fn [blocks]
+                                       (if (< (count blocks) 3)
+                                         (conj blocks content)
+                                         blocks)))))
+                         (sorted-map)
+                         (map first results))
+        ;; Return compact format: array of {page, blocks}
+        output (vec (map (fn [[title blocks]]
+                           {:page title
+                            :blocks blocks})
+                         by-page))]
+    (json-resp {:query   q
+                :results output
+                :pages   (count output)
                 :count   (count results)})))
 
 ;; ─── Templates ────────────────────────────────────────────────
@@ -347,6 +372,86 @@
     (catch Exception e
       (json-resp {:error (.getMessage e)} 500))))
 
+(defn create-page-handler
+  "POST /create-page — create a new page with title, optional properties, and optional template.
+   Body: EDN {:title \"Page Title\" :properties {\"key\" \"val\"} :template \"template-name\"}
+   Creates the .md file with frontmatter, applies template if given, reindexes."
+  [conn graph-dir request]
+  (try
+    (let [body       (read-edn-body request)
+          title      (:title body)
+          properties (:properties body {})
+          tmpl-name  (:template body)]
+      (if (str/blank? title)
+        (json-resp {:error "title is required"} 400)
+        (let [sanitized (str/replace title #"[/\\:?*\"<>|\n\r]" "_")
+              filename  (str sanitized ".md")
+              graph-dir-file (java.io.File. graph-dir)
+              filepath  (java.io.File. (java.io.File. graph-dir-file "pages") filename)]
+          (if (.exists filepath)
+            (json-resp {:error "page already exists" :title sanitized} 409)
+            ;; Build frontmatter
+            (let [prop-lines (for [[k v] properties]
+                               (str k ":: " v))
+                  frontmatter (str "title:: " title "\n"
+                                   (str/join "\n" prop-lines)
+                                   (when (seq properties) "\n")
+                                   "\n")
+                  content    (str frontmatter)
+                  _ (do (.mkdirs (.getParentFile filepath))
+                       (spit filepath content))
+                  ;; Apply template if requested
+                  _ (when (not (str/blank? tmpl-name))
+                      (let [tmpl-results (d/q '[:find (pull ?b [:block/content :block/children])
+                                                :where [?b :block/name ?name]
+                                                [?b :template/name ?name]]
+                                              @conn tmpl-name)
+                            tmpl-block  (when (seq tmpl-results) (ffirst tmpl-results))]
+                        (when tmpl-block
+                          (let [children (:block/children tmpl-block)
+                                tmpl-lines (for [c children]
+                                             (let [ct (:block/content c)]
+                                               (str "\t- " ct "\n")))]
+                            (when (seq tmpl-lines)
+                              (spit filepath (str/join tmpl-lines) :append true))))))
+                  ;; Reindex
+                  stats (index-and-record! conn graph-dir filename)]
+              (json-resp {:status "ok"
+                          :title  sanitized
+                          :file   (str "pages/" filename)
+                          :stats  stats}))))))
+    (catch Exception e
+      (json-resp {:error (.getMessage e)} 500))))
+
+(defn properties-schema-handler
+  "GET /properties-schema — return distinct property keys used across all pages,
+   with example values for the most common ones."
+  [conn _]
+  (try
+    (let [pages (d/q '[:find (pull ?p [*])
+                        :where [?p :page/property-keys]]
+                      @conn)
+          key-counts (atom {})
+          key-examples (atom {})]
+      (doseq [[raw-page] pages]
+        (let [page (fold-props raw-page)]
+          (doseq [[k v] (:properties page {})]
+            (swap! key-counts update k (fnil inc 0))
+            (when (or (not (get @key-examples k))
+                      (< (count (str (get @key-examples k))) (count (str v))))
+              (swap! key-examples assoc k v)))))
+      (let [sorted-keys (->> @key-counts
+                             (sort-by val)
+                             reverse
+                             (mapv first)
+                             (take 15))]
+        (json-resp {:properties (for [k sorted-keys]
+                                  {:key k
+                                   :count (@key-counts k)
+                                   :example (@key-examples k)})})))
+    (catch Exception e
+      (json-resp {:error (.getMessage e)} 500))))
+
 (defn update-block-handler
   "POST /update-block — replace the content of an existing block.
    Body: EDN {:id \"block-id\" :content \"new content\"}
@@ -416,10 +521,29 @@
                         (json-resp {:error "could not locate block in file"
                                     :block-id block-id :order order :level level
                                     :content-preview (str/trim (or old-content ""))} 404)
-                        (let [new-line  (str indent "- " content)
+                        (let [content-parts (str/split-lines content)
+                              ;; First line gets the bullet marker; continuations get
+                              ;; an extra indent (no bullet) to survive parser round-trips.
+                              continuation-indent (str indent "\t")
+                              new-lines-block (if (<= (count content-parts) 1)
+                                                 [(str indent "- " content)]
+                                                 (cons (str indent "- " (first content-parts))
+                                                       (map #(str continuation-indent %) (rest content-parts))))
+                              ;; Also consume any old continuation lines that followed
+                              ;; the original block (non-blank, non-bullet lines)
+                              skip-old (loop [i (inc idx)]
+                                        (if (>= i (count lines))
+                                          i
+                                          (let [l (nth lines i)
+                                                ll (count (take-while #(= % \tab) l))
+                                                has-bullet (re-find #"^\t*- " l)]
+                                            (cond
+                                              (str/blank? l) i
+                                              (and (not has-bullet) (>= ll level)) (recur (inc i))
+                                              :else i))))
                               new-lines (vec (concat (subvec lines 0 idx)
-                                                      [new-line]
-                                                      (subvec lines (inc idx))))]
+                                                      new-lines-block
+                                                      (subvec lines skip-old)))]
                           (spit filepath (str/join "\n" new-lines))
                           (index-and-record! conn graph-dir filename)
                           ;; block-id counter increments on reindex, so fetch the new id
@@ -444,16 +568,25 @@
 
 (defn- find-block-line-index
   "Find the line index of a block in the file lines vector.
-  Uses exact content match first, then bullet-line counting at target level."
+   Uses exact content match first (tries both with and without bullet prefix),
+   then bullet-line counting at target level."
   [lines level order old-content]
   (let [indent (apply str (repeat level "\t"))
-        exact-match (when old-content
-                      (first (keep-indexed
-                               (fn [i line]
-                                 (when (= line (str indent "- " old-content))
-                                   i))
-                               lines)))
-        order-match (when-not exact-match
+        ;; Try exact match with bullet prefix: "\t- content"
+        exact-bullet-match (when old-content
+                            (first (keep-indexed
+                                     (fn [i line]
+                                       (when (= line (str indent "- " old-content))
+                                         i))
+                                     lines)))
+        ;; Try exact match without bullet prefix: "\tcontent" (property lines)
+        exact-plain-match (when (and old-content (nil? exact-bullet-match))
+                           (first (keep-indexed
+                                    (fn [i line]
+                                      (when (= line (str indent old-content))
+                                        i))
+                                    lines)))
+        order-match (when-not (or exact-bullet-match exact-plain-match)
                       (let [bullet-idx (atom -1)]
                         (first (keep-indexed
                                  (fn [i line]
@@ -463,7 +596,7 @@
                                        (swap! bullet-idx inc)
                                        (when (= @bullet-idx order) i))))
                                  lines))))]
-    (or exact-match order-match)))
+    (or exact-bullet-match exact-plain-match order-match)))
 
 (defn- skip-children
   "Starting from the line after idx, skip forward past all lines whose indent
@@ -560,6 +693,91 @@
                                         :page page-title
                                         :file (str target-dir "/" filename)})))))))))
             (json-resp {:error "block not found" :block-id after-id} 404)))))
+    (catch Exception e
+      (json-resp {:error (.getMessage e)} 500))))
+
+(defn delete-block-handler
+  "POST /delete-block — delete a block from the markdown file.
+   Body: EDN {:block-id \"Page-7\" :inherit-children true}
+   :inherit-children (optional, default true): when true, children are outdented
+   one level so they become siblings of the deleted block's parent. When false,
+   the entire subtree (block + all descendants) is removed.
+   Returns the block-id and whether it had children."
+  [conn graph-dir request]
+  (try
+    (let [body      (read-edn-body request)
+          block-id  (:block-id body)
+          inherit?  (if (nil? (:inherit-children body)) true (:inherit-children body))]
+      (cond
+        (str/blank? block-id)
+        (json-resp {:error "block-id is required"} 400)
+
+        :else
+        (let [result (d/q '[:find (pull ?b [:block/content
+                                            :block/level
+                                            :block/order
+                                            {:block/page [:page/title]}])
+                           :in $ ?bid
+                           :where [?b :block/id ?bid]]
+                         @conn block-id)]
+          (if-let [block (ffirst result)]
+            (let [page-title  (-> block :block/page :page/title)
+                  cur-level   (:block/level block)
+                  order       (:block/order block)
+                  old-content (:block/content block)]
+              (if (str/blank? page-title)
+                (json-resp {:error "block has no associated page"} 404)
+                (let [graph-dir-file (java.io.File. graph-dir)
+                      is-journal?   (re-matches #"\d{4}_\d{2}_\d{2}" page-title)
+                      target-dir    (if is-journal? "journals" "pages")
+                      filename      (str (str/replace page-title #"[\"/\\:?*<>|]" "_") ".md")
+                      filepath      (java.io.File. (java.io.File. graph-dir-file target-dir) filename)]
+                  (if-not (.exists filepath)
+                    (json-resp {:error "source file not found"
+                                :file (str target-dir "/" filename)} 404)
+                    (let [lines (str/split-lines (slurp filepath))
+                          idx   (find-block-line-index lines cur-level order old-content)]
+                      (if (nil? idx)
+                        (json-resp {:error "could not locate block in file"
+                                    :block-id block-id :order order :level cur-level} 404)
+                        (let [end-idx       (skip-children lines idx cur-level)
+                              has-children? (> (- end-idx idx) 1)]
+                          (if inherit?
+                            ;; Inherit mode: remove the target block line, outdent children by 1
+                            (let [child-lines    (subvec lines (inc idx) end-idx)
+                                  outdented      (mapv (fn [line]
+                                                         (let [line-level (count (take-while #(= % \tab) line))
+                                                               rest-part   (subs line line-level)]
+                                                           ;; blank lines — leave alone
+                                                           (if (str/blank? line)
+                                                             line
+                                                             ;; outdent by 1 level (min 0)
+                                                             (let [new-lvl (max 0 (dec line-level))]
+                                                               (str (apply str (repeat new-lvl \tab)) rest-part)))))
+                                                       child-lines)
+                                  new-lines      (vec (concat (subvec lines 0 idx)
+                                                              outdented
+                                                              (subvec lines end-idx)))]
+                              (spit filepath (str/join "\n" new-lines))
+                              (index-and-record! conn graph-dir filename)
+                              (json-resp {:status         "ok"
+                                          :block-id       block-id
+                                          :page           page-title
+                                          :had-children?  has-children?
+                                          :mode           "inherit"
+                                          :file           (str target-dir "/" filename)}))
+                            ;; Delete-all mode: remove the entire subtree
+                            (let [new-lines (vec (concat (subvec lines 0 idx)
+                                                          (subvec lines end-idx)))]
+                              (spit filepath (str/join "\n" new-lines))
+                              (index-and-record! conn graph-dir filename)
+                              (json-resp {:status         "ok"
+                                          :block-id       block-id
+                                          :page           page-title
+                                          :had-children?  has-children?
+                                          :mode           "delete-all"
+                                          :file           (str target-dir "/" filename)})))))))))))
+            (json-resp {:error "block not found" :block-id block-id} 404))))
     (catch Exception e
       (json-resp {:error (.getMessage e)} 500))))
 
@@ -750,6 +968,153 @@
     (catch Exception e
       (json-resp {:error (.getMessage e)} 400))))
 
+;; ─── Image Upload ────────────────────────────────────────────
+
+(defn upload-handler
+  "POST /upload — accept image upload (raw body), save to graph assets/ dir.
+  Uses X-Filename header for original name, Content-Type for extension fallback.
+  Returns JSON {:path \"../assets/filename.ext\" :url \"/api/assets/filename.ext\"}"
+  [graph-dir request]
+  (try
+    (let [body      (:body request)
+          headers   (:headers request)
+          raw-name  (or (get headers "x-filename") "upload")
+          filename  (str (UUID/randomUUID) "-"
+                         (-> raw-name (str/replace #"[^\w.\-]" "_")))
+          assets-dir (java.io.File. graph-dir "assets")
+          _          (.mkdirs assets-dir)
+          dest       (java.io.File. assets-dir filename)]
+      (clojure.java.io/copy body dest)
+      (json-resp {:path  (str "../assets/" filename)
+                  :url   (str "/api/assets/" filename)
+                  :name  filename}))
+    (catch Exception e
+      (json-resp {:error (.getMessage e)} 500))))
+
+;; ─── Asset Serving ───────────────────────────────────────────
+
+(defn asset-handler
+  "GET /assets/:filename — serve a file from the graph's assets/ directory."
+  [graph-dir request uri]
+  (try
+    (let [filename  (subs uri 8) ; strip "/assets/"
+          assets-dir (java.io.File. graph-dir "assets")
+          file       (java.io.File. assets-dir filename)
+          ;; Security: ensure resolved path is inside assets/
+          canonical-base (.getCanonicalPath assets-dir)
+          canonical-file (.getCanonicalPath file)]
+      (if (and (.exists file)
+               (.isFile file)
+               (str/starts-with? canonical-file canonical-base))
+        (let [ext      (or (some-> (re-find #"\.(\w+)$" filename) second) "")
+              mime     (case (str/lower-case ext)
+                         "png"  "image/png"
+                         "jpg"  "image/jpeg"
+                         "jpeg" "image/jpeg"
+                         "gif"  "image/gif"
+                         "webp" "image/webp"
+                         "svg"  "image/svg+xml"
+                         "pdf"  "application/pdf"
+                         "application/octet-stream")
+              bytes    (clojure.java.io/input-stream file)]
+          {:status  200
+           :headers {"Content-Type" mime
+                     "Cache-Control" "public, max-age=86400"}
+           :body    bytes})
+        {:status  404
+         :headers {"Content-Type" "application/json"}
+         :body    (json/generate-string {:error "not found"})}))
+    (catch Exception e
+      {:status  500
+       :headers {"Content-Type" "application/json"}
+       :body    (json/generate-string {:error (.getMessage e)})})))
+
+;; ─── Library & Graph views ────────────────────────────────────
+
+(defn- excluded-title?
+  "Titles hidden from library/graph: journals, cron/system pages, Logseq date pages."
+  [title]
+  (boolean
+   (or (re-matches #"(?i)^\d{4}[-_]\d{2}[-_]\d{2}.*" (str title))
+       (re-matches #"(?i)^TODAY - .*" (str title))
+       (re-matches #"(?i)^[A-Z][a-z]{2} \d{1,2}(?:st|nd|rd|th), \d{4}.*" (str title)))))
+
+(defn- private-titles
+  "Set of page titles with private:: true."
+  [conn]
+  (->> (d/q '[:find ?t
+              :where [?p :page/title ?t]
+                     [?p :prop/private "true"]] @conn)
+       (map first)
+       set))
+
+(defn library-handler
+  "GET /library - page cards: title, mtime, first-content snippet, top refs."
+  [conn _]
+  (let [private (private-titles conn)
+        pages   (->> (d/q '[:find (pull ?p [*]) :where [?p :page/title]] @conn)
+                     (map first)
+                     (map fold-props))
+        page-meta (into {} (map (fn [p] {[(:page/title p)] p}) pages))
+        blocks  (->> (d/q '[:find (pull ?b [:block/content :block/order
+                                            {:block/page [:page/title]}
+                                            {:block/refs  [:page/title]}])
+                            :where [?b :block/page]] @conn)
+                     (map first))
+        by-page (group-by #(get-in % [:block/page :page/title]) blocks)
+        cards   (->>
+                  (for [title (keys by-page)
+                        :when (and (not (excluded-title? title))
+                                   (not (private title)))]
+                    (let [blks   (sort-by (fn [b] (or (:block/order b) 0)) (get by-page title))
+                          body   (remove (fn [b] (re-matches #"(?i)^[\w-]+::.*" (str (:block/content b)))) blks)
+                          firstb (some-> (first body) :block/content str/trim)
+                          snippet (if firstb
+                                    (subs firstb 0 (min 160 (count firstb)))
+                                    "")
+                          ref-freq (frequencies
+                                    (mapcat (fn [b] (map :page/title (:block/refs b))) blks))
+                          tags   (->> ref-freq
+                                      (sort-by (fn [e] (- (val e))))
+                                      (map key)
+                                      (remove (fn [t] (= t title)))
+                                      (take 3))
+                          meta   (get page-meta title)
+                          mtime  (when-let [f (:page/file meta)]
+                                   (let [file (java.io.File. ^String f)]
+                                     (when (.exists file) (.lastModified file))))]
+                      {:title title :mtime mtime :snippet snippet :tags tags}))
+                  (filter :title)
+                  vec)]
+    (json-resp {:pages cards :count (count cards)})))
+
+(defn graph-handler
+  "GET /graph - force-graph edge list. Nodes: pages with >=2 links to other
+   visible pages. Excludes journals/system/private (same rules as library)."
+  [conn _]
+  (let [private (private-titles conn)
+        visible? (fn [t] (and (not (excluded-title? t)) (not (private t))))
+        edges  (->> (d/q '[:find ?pt ?rt
+                           :where [?b :block/page ?p]
+                                  [?b :block/refs ?r]
+                                  [?p :page/title ?pt]
+                                  [?r :page/title ?rt]] @conn)
+                    (map (fn [[a b]] (if (neg? (compare a b)) [a b] [b a])))
+                    set
+                    (filter (fn [[a b]] (and (not= a b) (visible? a) (visible? b))))
+                    set)
+        degree (reduce (fn [acc [a b]]
+                         (-> acc (update a (fnil inc 0)) (update b (fnil inc 0))))
+                       {} edges)
+        node-titles (->> degree (filter (fn [[_ d]] (>= d 2))) (map key) sort)
+        node-set (set node-titles)
+        nodes  (map (fn [t] {:title t :degree (get degree t)}) node-titles)
+        final-edges (filter (fn [[a b]] (and (node-set a) (node-set b))) edges)]
+    (json-resp {:nodes nodes
+                :edges (vec final-edges)
+                :node-count (count nodes)
+                :edge-count (count final-edges)})))
+
 (defn make-app [conn graph-dir]
   (params/wrap-params
     (fn [request]
@@ -764,6 +1129,12 @@
 
           (and (= method :get) (= uri "/pages"))
           (pages-handler conn request)
+
+          (and (= method :get) (= uri "/library"))
+          (library-handler conn request)
+
+          (and (= method :get) (= uri "/graph"))
+          (graph-handler conn request)
 
           (and (= method :get) (str/starts-with? uri "/page/"))
           (page-handler conn (assoc-in request [:params "title"] (subs uri 6)))
@@ -780,6 +1151,12 @@
           (and (= method :get) (= uri "/templates"))
           (templates-handler conn request)
 
+          (and (= method :get) (= uri "/properties-schema"))
+          (properties-schema-handler conn request)
+
+          (and (= method :post) (= uri "/create-page"))
+          (create-page-handler conn graph-dir request)
+
           (and (= method :post) (= uri "/append"))
           (append-handler conn graph-dir request)
 
@@ -788,6 +1165,9 @@
 
           (and (= method :post) (= uri "/insert-block"))
           (insert-block-handler conn graph-dir request)
+
+          (and (= method :post) (= uri "/delete-block"))
+          (delete-block-handler conn graph-dir request)
 
           (and (= method :post) (= uri "/change-block-level"))
           (change-block-level-handler conn graph-dir request)
@@ -803,6 +1183,12 @@
 
           (and (= method :post) (= uri "/push/unsubscribe"))
           (push-unsubscribe-handler graph-dir request)
+
+          (and (= method :post) (= uri "/upload"))
+          (upload-handler graph-dir request)
+
+          (and (= method :get) (str/starts-with? uri "/assets/"))
+          (asset-handler graph-dir request uri)
 
           (and (= method :get) (str/starts-with? uri "/block/"))
           (let [suffix (subs uri 7)]
