@@ -894,6 +894,87 @@
     (catch Exception e
       (json-resp {:error (.getMessage e)} 500))))
 
+(defn set-page-property-handler
+  "POST /set-page-property — set or remove a page-level property.
+   Body: EDN {:title \"Page\" :key \"public\" :value \"true\"} or {:remove true}.
+   Handles both property forms:
+   - bare Logseq form:   public:: true   (leading property zone, no frontmatter)
+   - YAML frontmatter:   public: true    (inside --- ... --- block)
+   Removing a missing property is a no-op. Reindexes + records mtime."
+  [conn graph-dir request]
+  (try
+    (let [body    (read-edn-body request)
+          title   (:title body)
+          pkey    (:key body)
+          value   (:value body)
+          remove? (boolean (:remove body))]
+      (if (or (str/blank? title) (str/blank? pkey))
+        (json-resp {:error "title and key are required"} 400)
+        (let [filename (str (str/replace title #"[/\\:?*\"<>|\n\r]" "_") ".md")
+              path     (resolve-file-path graph-dir filename)]
+          (if (nil? path)
+            (json-resp {:error "page not found" :title title} 404)
+            (let [lines   (str/split-lines (slurp path))
+                  n       (count lines)
+                  write!  (fn [new-lines] (spit path (str (str/join "\n" new-lines) "\n")))
+                  fm-end  (when (and (seq lines) (= (str/trim (first lines)) "---"))
+                            (loop [i 1]
+                              (cond
+                                (>= i n) nil
+                                (= (str/trim (nth lines i)) "---") i
+                                :else (recur (inc i)))))
+                  bare-re (re-pattern (str "^" (java.util.regex.Pattern/quote pkey) "::\\s*.*$"))
+                  yaml-re (re-pattern (str "^\\s*" (java.util.regex.Pattern/quote pkey) ":\\s*.*$"))
+                  apply!  (fn []
+                            (if fm-end
+                              (let [idx (loop [i 1]
+                                          (cond
+                                            (>= i fm-end) nil
+                                            (re-find yaml-re (nth lines i)) i
+                                            :else (recur (inc i))))]
+                                (cond
+                                  (and remove? idx)
+                                  (write! (concat (subvec lines 0 idx) (subvec lines (inc idx))))
+
+                                  (and (not remove?) idx)
+                                  (write! (concat (subvec lines 0 idx)
+                                                  [(str pkey ": " value)]
+                                                  (subvec lines (inc idx))))
+
+                                  (not remove?)
+                                  (write! (concat [(first lines)]
+                                                  [(str pkey ": " value)]
+                                                  (rest lines)))
+
+                                  :else nil))
+                              (let [zcount (count (take-while #(not (re-find #"^\t*- " %)) lines))
+                                    idx    (loop [i 0]
+                                              (cond
+                                                (>= i zcount) nil
+                                                (re-find bare-re (nth lines i)) i
+                                                :else (recur (inc i))))]
+                                (cond
+                                  (and remove? idx)
+                                  (write! (concat (subvec lines 0 idx) (subvec lines (inc idx))))
+
+                                  (and (not remove?) idx)
+                                  (write! (concat (subvec lines 0 idx)
+                                                  [(str pkey ":: " value)]
+                                                  (subvec lines (inc idx))))
+
+                                  (not remove?)
+                                  (write! (concat (subvec lines 0 zcount)
+                                                  [(str pkey ":: " value)]
+                                                  (subvec lines zcount)))
+
+                                  :else nil))))]
+              (apply!)
+              (json-resp {:status "ok" :title title :key pkey
+                          :action (if remove? "removed" "set")
+                          :stats (index-and-record! conn graph-dir filename)}))))))
+    (catch Exception e
+      (json-resp {:error (.getMessage e)} 500))))
+
 (defn block-handler [conn request]
   (let [raw-uuid (get-in request [:params "uuid"])]
     (if (str/blank? raw-uuid)
@@ -1055,7 +1136,7 @@
         pages   (->> (d/q '[:find (pull ?p [*]) :where [?p :page/title]] @conn)
                      (map first)
                      (map fold-props))
-        page-meta (into {} (map (fn [p] {[(:page/title p)] p}) pages))
+        page-meta (into {} (map (fn [p] {(:page/title p) p}) pages))
         blocks  (->> (d/q '[:find (pull ?b [:block/content :block/order
                                             {:block/page [:page/title]}
                                             {:block/refs  [:page/title]}])
@@ -1177,6 +1258,9 @@
 
           (and (= method :post) (= uri "/reindex-file"))
           (reindex-file-handler conn graph-dir request)
+
+          (and (= method :post) (= uri "/set-page-property"))
+          (set-page-property-handler conn graph-dir request)
 
           (and (= method :post) (= uri "/push/subscribe"))
           (push-subscribe-handler graph-dir request)
