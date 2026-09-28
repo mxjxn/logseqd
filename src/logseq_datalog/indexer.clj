@@ -133,6 +133,20 @@
                                    @conn title)
         retract-txs (mapv #(vector :db/retractEntity %) existing-block-eids)
 
+        ;; Step 1b: Retract stale page-level attributes. The file is the source
+        ;; of truth: a :prop/<key> (or :page/tags / :page/property-keys) that no
+        ;; longer exists in the parsed file must not survive the upsert below —
+        ;; DataScript upserts only overwrite attributes present in the tx, so a
+        ;; removed `private:: true` or `position:: 2` would otherwise linger in
+        ;; the index until a full restart. Blocks are safe (fully retracted
+        ;; above and re-added); only the page entity persists across indexes.
+        old-page (d/pull @conn '[*] [:page/title title])
+        stale-prop-keys (keep #(when (= "prop" (namespace %)) %) (keys old-page))
+        page-attr-retracts (into (mapv #(vector :db/retract [:page/title title] %)
+                                       stale-prop-keys)
+                                 [[:db/retract [:page/title title] :page/property-keys]
+                                  [:db/retract [:page/title title] :page/tags]])
+
         ;; Step 2: Collect inline tags from the freshly-parsed blocks
         new-tags (collect-tags (:blocks parsed))
 
@@ -148,7 +162,7 @@
 
                    (seq (:properties parsed))
                    (merge (props->tx (:properties parsed) :page/property-keys)))
-        _ (d/transact! conn (-> retract-txs (into tag-txs) (conj page-tx)))
+        _ (d/transact! conn (-> retract-txs (into page-attr-retracts) (into tag-txs) (conj page-tx)))
 
         ;; Step 4: Build tag lookup after the above transaction
         tag-lookup (into {}
