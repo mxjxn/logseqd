@@ -129,6 +129,12 @@
   (when-let [m (re-matches #"(TODO|DOING|DONE|LATER|NOW|CANCEL)\s+(.*)" content)]
     [(keyword (second m)) (nth m 2)]))
 
+(defn- strip-code-spans
+  "Remove fenced code spans from content before metadata extraction, so
+   e.g. bash [[ ]] tests inside ``` blocks don't become phantom page refs."
+  [content]
+  (str/replace content #"(?s)```.*?```" ""))
+
 (defn- extract-tags [content]
   (let [regular  (map second (re-seq #"#([\w/-]+)" content))
         backtick (map second (re-seq #"`#([\w/-]+)`" content))]
@@ -144,12 +150,13 @@
   (map second (re-seq #"\{\{embed\s+\(\(([0-9a-f-]+)\)\)\}\}" content)))
 
 (defn- make-block [content level]
-  (let [[todo content'] (or (extract-todo content) [nil content])]
+  (let [[todo content'] (or (extract-todo content) [nil content])
+        meta-content (strip-code-spans content')]
     {:level      level
      :content    (str/trim content')
      :todo       todo
-     :tags       (extract-tags content')
-     :refs       (extract-page-refs content')
+     :tags       (extract-tags meta-content)
+     :refs       (extract-page-refs meta-content)
      :block-refs (extract-block-refs content')
      :embeds     (extract-embeds content')
      :properties {}
