@@ -146,3 +146,19 @@ Powers knowledge-graph queries for AI agents — cron jobs write structured data
 ## License
 
 [CC0 1.0 Universal](https://creativecommons.org/publicdomain/zero/1.0/) — public domain, no rights reserved. Do whatever you want with it.
+
+
+## Reliable block writes
+
+Block mutations use source spans recorded during indexing. This distinguishes
+repeated block text under different parents and handles multiline text and
+bullets inside code fences. A write is refused if its source file changed since
+indexing. Restart/reindex after upgrading so every block has these coordinates.
+Content updates preserve existing block properties and task status unless a new
+task status is explicitly included in the submitted content.
+
+Regression checks:
+
+```sh
+clojure -Sdeps '{:paths ["src" "test"]}' -M -e "(require 'logseq-datalog.write-test) (let [r (clojure.test/run-tests 'logseq-datalog.write-test)] (System/exit (+ (:fail r) (:error r))))"
+```

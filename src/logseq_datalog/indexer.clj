@@ -61,7 +61,7 @@
 (defn- page->block-tx
   "Convert a parsed page's block tree into transaction data.
   Uses negative integer tempids for parent-child links."
-  [{:keys [title blocks]} this-page-eid page-lookup tag-lookup]
+  [{:keys [title blocks mtime]} this-page-eid page-lookup tag-lookup]
   (let [result (atom [])]
     (letfn [(process [block parent-tempid order]
               (let [tid (next-tempid)
@@ -84,6 +84,11 @@
                                 :block/order  order
                                 :block/page   this-page-eid
                                 :block/source title}
+                         (some? (:line block))      (assoc :block/line (:line block)
+                                                          :block/source-line (:source-line block)
+                                                          :block/end-line (:end-line block)
+                                                          :block/subtree-end-line (:subtree-end-line block)
+                                                          :block/source-mtime mtime)
                          (:uuid block)              (assoc :block/uuid (:uuid block))
                          (:todo block)              (assoc :block/todo (name (:todo block)))
                          parent-tempid              (assoc :block/parent parent-tempid)

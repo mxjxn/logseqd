@@ -253,6 +253,37 @@
                      :children (mapv resolve-node @(:children node))))]
       (mapv resolve-node @roots))))
 
+(defn- attach-source-spans
+  "Attach exact raw-file ranges in document order. Code-fence contents do not
+   count as blocks. Ranges are zero-based and end-exclusive."
+  [tree body offset]
+  (let [positions (loop [indexed (map-indexed vector body) fences 0 result []]
+                    (if-let [[i line] (first indexed)]
+                      (recur (rest indexed) (+ fences (count-fences line))
+                             (if (and (even? fences) (block-line? line))
+                               (conj result {:line (+ offset i)
+                                             :source-line line
+                                             :level (indent-level line)})
+                               result))
+                      result))
+        parsed-count (count (mapcat #(tree-seq (comp seq :children) :children %) tree))
+        end (+ offset (count body))
+        cursor (atom -1)]
+    ;; Unsupported/malformed fence structure must fail closed for writes.
+    (if (not= parsed-count (count positions))
+      tree
+      (letfn [(annotate [block]
+                (let [i (swap! cursor inc)
+                      position (nth positions i)
+                      next-line (or (:line (get positions (inc i))) end)
+                      subtree-end (or (:line (first (filter #(<= (:level %) (:level block))
+                                                           (drop (inc i) positions)))) end)]
+                  (assoc block :line (:line position)
+                         :source-line (:source-line position)
+                         :end-line next-line :subtree-end-line subtree-end
+                         :children (mapv annotate (:children block)))))]
+        (mapv annotate tree)))))
+
 ;; ─── File Parsing ─────────────────────────────────────────────
 
 (defn parse-file
@@ -264,7 +295,8 @@
         {:keys [frontmatter body]} (parse-frontmatter lines)
         processed (preprocess-code-blocks body)
         flat-blocks (collect-flat-blocks processed)
-        block-tree (build-tree flat-blocks)
+        block-tree (attach-source-spans (build-tree flat-blocks) body
+                                       (- (count lines) (count body)))
         ^File f (File. file-path)
         filename (.getName f)
         title (or (get frontmatter "title")
@@ -275,7 +307,8 @@
                         (str/replace #"___" "/"))))
         ;; page-level properties = frontmatter minus title/tags
         page-props (dissoc frontmatter "title" "tags")]
-    {:title      title
+    {:mtime      (.lastModified f)
+     :title      title
      :tags       (get frontmatter "tags" [])
      :properties page-props
      :journal?   journal?

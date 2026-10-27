@@ -4,7 +4,8 @@
             [clojure.string :as str]
             [cheshire.core :as json]
             [ring.middleware.params :as params]
-            [logseq-datalog.indexer :as indexer])
+            [logseq-datalog.indexer :as indexer]
+            [logseq-datalog.parser :as parser])
   (:import [java.io PushbackReader InputStreamReader File]
          [java.util UUID]))
 
@@ -452,6 +453,25 @@
     (catch Exception e
       (json-resp {:error (.getMessage e)} 500))))
 
+(defn- indexed-block-line
+  "A write uses its indexed source position, never content matching or sibling
+   order. Refuse if the file changed after indexing."
+  [lines filepath block]
+  (let [idx (:block/line block)]
+    (when (and (integer? idx) (<= 0 idx) (< idx (count lines))
+               (= (:block/source-mtime block) (.lastModified ^File filepath))
+               (= (:block/source-line block) (nth lines idx)))
+      idx)))
+
+(defn- existing-property-lines [lines start end]
+  (second
+    (reduce (fn [[fences props] [i line]]
+              [(+ fences (count (re-seq #"```" line)))
+               (if (and (pos? i) (even? fences)
+                        (parser/parse-property-line (str/trim line)))
+                 (conj props line) props)])
+            [0 []] (map-indexed vector (subvec lines start end)))))
+
 (defn update-block-handler
   "POST /update-block — replace the content of an existing block.
    Body: EDN {:id \"block-id\" :content \"new content\"}
@@ -473,6 +493,9 @@
         :else
         (let [;; Look up block in DataScript
               result (d/q '[:find (pull ?b [:block/content
+                                             :block/todo
+                                             :block/line :block/source-line :block/source-mtime
+                                             :block/end-line :block/subtree-end-line
                                              :block/level
                                              :block/order
                                              {:block/page [:page/title]}])
@@ -497,31 +520,16 @@
                                 :file (str target-dir "/" filename)} 404)
                     ;; Find and replace the block line
                     (let [lines      (str/split-lines (slurp filepath))
-                          ;; Strategy 1: exact content match (most reliable)
                           indent      (apply str (repeat level "\t"))
-                          exact-match (when old-content
-                                        (first (keep-indexed
-                                                 (fn [i line]
-                                                   (when (= line (str indent "- " old-content))
-                                                     i))
-                                                 lines)))
-                          ;; Strategy 2: count bullet lines at this level to find order
-                          order-match (when-not exact-match
-                                        (let [bullet-idx (atom -1)]
-                                          (first (keep-indexed
-                                                   (fn [i line]
-                                                     (let [line-level (count (take-while #(= % "\t") line))]
-                                                       (when (and (= line-level level)
-                                                                  (re-find #"^\t*- " line))
-                                                         (swap! bullet-idx inc)
-                                                         (when (= @bullet-idx order) i))))
-                                                   lines))))
-                          idx (or exact-match order-match)]
+                          idx         (indexed-block-line lines filepath block)]
                       (if (nil? idx)
                         (json-resp {:error "could not locate block in file"
                                     :block-id block-id :order order :level level
                                     :content-preview (str/trim (or old-content ""))} 404)
-                        (let [content-parts (str/split-lines content)
+                        (let [content (if (and (:block/todo block)
+                                                     (not (re-find #"^(TODO|DOING|DONE|LATER|NOW|CANCEL)\s" content)))
+                                              (str (:block/todo block) " " content) content)
+                              content-parts (str/split-lines content)
                               ;; First line gets the bullet marker; continuations get
                               ;; an extra indent (no bullet) to survive parser round-trips.
                               continuation-indent (str indent "\t")
@@ -531,16 +539,11 @@
                                                        (map #(str continuation-indent %) (rest content-parts))))
                               ;; Also consume any old continuation lines that followed
                               ;; the original block (non-blank, non-bullet lines)
-                              skip-old (loop [i (inc idx)]
-                                        (if (>= i (count lines))
-                                          i
-                                          (let [l (nth lines i)
-                                                ll (count (take-while #(= % \tab) l))
-                                                has-bullet (re-find #"^\t*- " l)]
-                                            (cond
-                                              (str/blank? l) i
-                                              (and (not has-bullet) (>= ll level)) (recur (inc i))
-                                              :else i))))
+                              skip-old (:block/end-line block)
+                              ;; Keep existing block properties (including UUIDs) when
+                              ;; replacing content. Continuations are replaced, not kept.
+                              property-lines (existing-property-lines lines idx skip-old)
+                              new-lines-block (concat new-lines-block property-lines)
                               new-lines (vec (concat (subvec lines 0 idx)
                                                       new-lines-block
                                                       (subvec lines skip-old)))]
@@ -548,13 +551,12 @@
                           (index-and-record! conn graph-dir filename)
                           ;; block-id counter increments on reindex, so fetch the new id
                           (let [new-result (d/q '[:find (pull ?b [:block/id])
-                                               :in $ ?pt ?ord ?lvl
+                                               :in $ ?pt ?line
                                                :where [?b :block/id ?bid]
-                                                      [?b :block/order ?ord]
-                                                      [?b :block/level ?lvl]
+                                                      [?b :block/line ?line]
                                                       [?p :page/title ?pt]
                                                       [?b :block/page ?p]]
-                                             @conn page-title order level)
+                                             @conn page-title idx)
                                 new-bid (-> new-result ffirst :block/id)]
                             (json-resp {:status "ok"
                                         :block-id new-bid
@@ -565,60 +567,6 @@
             (json-resp {:error "block not found" :block-id block-id} 404)))))
     (catch Exception e
       (json-resp {:error (.getMessage e)} 500))))
-
-(defn- find-block-line-index
-  "Find the line index of a block in the file lines vector.
-   Uses exact content match first (tries both with and without bullet prefix),
-   then bullet-line counting at target level."
-  [lines level order old-content]
-  (let [indent (apply str (repeat level "\t"))
-        ;; Try exact match with bullet prefix: "\t- content"
-        exact-bullet-match (when old-content
-                            (first (keep-indexed
-                                     (fn [i line]
-                                       (when (= line (str indent "- " old-content))
-                                         i))
-                                     lines)))
-        ;; Try exact match without bullet prefix: "\tcontent" (property lines)
-        exact-plain-match (when (and old-content (nil? exact-bullet-match))
-                           (first (keep-indexed
-                                    (fn [i line]
-                                      (when (= line (str indent old-content))
-                                        i))
-                                    lines)))
-        order-match (when-not (or exact-bullet-match exact-plain-match)
-                      (let [bullet-idx (atom -1)]
-                        (first (keep-indexed
-                                 (fn [i line]
-                                   (let [line-level (count (take-while #(= % \tab) line))]
-                                     (when (and (= line-level level)
-                                                (re-find #"^\t*- " line))
-                                       (swap! bullet-idx inc)
-                                       (when (= @bullet-idx order) i))))
-                                 lines))))]
-    (or exact-bullet-match exact-plain-match order-match)))
-
-(defn- skip-children
-  "Starting from the line after idx, skip forward past all lines whose indent
-   level is strictly greater than target-level, or lines that don't start with
-   a bullet (continuation/property lines belonging to a child block).
-   Returns the index after the last child (or idx+1 if no children follow)."
-  [lines idx target-level]
-  (loop [i (inc idx)]
-    (if (>= i (count lines))
-      i
-      (let [line       (nth lines i)
-            line-level (count (take-while #(= % \tab) line))
-            has-bullet (re-find #"^\t*- " line)]
-        (cond
-          ;; strictly deeper indent — part of subtree
-          (> line-level target-level)
-          (recur (inc i))
-          ;; same tab-level or shallower but no bullet — continuation/property
-          ;; line belonging to the last child block
-          (and (<= line-level target-level) (not has-bullet) (not (str/blank? line)))
-          (recur (inc i))
-          :else i)))))
 
 (defn insert-block-handler
   "POST /insert-block — insert a new block after an existing block.
@@ -643,6 +591,8 @@
 
         :else
         (let [result (d/q '[:find (pull ?b [:block/content
+                                             :block/line :block/source-line :block/source-mtime
+                                             :block/end-line :block/subtree-end-line
                                              :block/level
                                              :block/order
                                              {:block/page [:page/title]}])
@@ -665,11 +615,11 @@
                     (json-resp {:error "source file not found"
                                 :file (str target-dir "/" filename)} 404)
                     (let [lines      (str/split-lines (slurp filepath))
-                          idx        (find-block-line-index lines block-level order old-content)]
+                          idx        (indexed-block-line lines filepath block)]
                       (if (nil? idx)
                         (json-resp {:error "could not locate block in file"
                                     :block-id after-id :order order :level block-level} 404)
-                        (let [insert-pos (skip-children lines idx block-level)
+                        (let [insert-pos (:block/subtree-end-line block)
                               new-indent (apply str (repeat level "\t"))
                               new-line   (str new-indent "- " content)
                               new-lines  (vec (concat (subvec lines 0 insert-pos)
@@ -677,15 +627,13 @@
                                                       (subvec lines insert-pos)))]
                           (spit filepath (str/join "\n" new-lines))
                           (index-and-record! conn graph-dir filename)
-                          (let [new-order (inc order)
-                                new-result (d/q '[:find (pull ?b [:block/id])
-                                                 :in $ ?pt ?ord ?lvl
+                          (let [new-result (d/q '[:find (pull ?b [:block/id])
+                                                 :in $ ?pt ?line
                                                  :where [?b :block/id ?bid]
-                                                        [?b :block/order ?ord]
-                                                        [?b :block/level ?lvl]
+                                                        [?b :block/line ?line]
                                                         [?p :page/title ?pt]
                                                         [?b :block/page ?p]]
-                                                @conn page-title new-order level)
+                                                @conn page-title insert-pos)
                                 new-bid (-> new-result ffirst :block/id)]
                             (json-resp {:status "ok"
                                         :block-id new-bid
@@ -714,6 +662,8 @@
 
         :else
         (let [result (d/q '[:find (pull ?b [:block/content
+                                             :block/line :block/source-line :block/source-mtime
+                                             :block/end-line :block/subtree-end-line
                                             :block/level
                                             :block/order
                                             {:block/page [:page/title]}])
@@ -736,15 +686,15 @@
                     (json-resp {:error "source file not found"
                                 :file (str target-dir "/" filename)} 404)
                     (let [lines (str/split-lines (slurp filepath))
-                          idx   (find-block-line-index lines cur-level order old-content)]
+                          idx   (indexed-block-line lines filepath block)]
                       (if (nil? idx)
                         (json-resp {:error "could not locate block in file"
                                     :block-id block-id :order order :level cur-level} 404)
-                        (let [end-idx       (skip-children lines idx cur-level)
-                              has-children? (> (- end-idx idx) 1)]
+                        (let [end-idx       (:block/subtree-end-line block)
+                              has-children? (> end-idx (:block/end-line block))]
                           (if inherit?
                             ;; Inherit mode: remove the target block line, outdent children by 1
-                            (let [child-lines    (subvec lines (inc idx) end-idx)
+                            (let [child-lines    (subvec lines (:block/end-line block) end-idx)
                                   outdented      (mapv (fn [line]
                                                          (let [line-level (count (take-while #(= % \tab) line))
                                                                rest-part   (subs line line-level)]
@@ -776,8 +726,8 @@
                                           :page           page-title
                                           :had-children?  has-children?
                                           :mode           "delete-all"
-                                          :file           (str target-dir "/" filename)})))))))))))
-            (json-resp {:error "block not found" :block-id block-id} 404))))
+                                          :file           (str target-dir "/" filename)}))))))))))
+            (json-resp {:error "block not found" :block-id block-id} 404)))))
     (catch Exception e
       (json-resp {:error (.getMessage e)} 500))))
 
@@ -804,6 +754,8 @@
 
         :else
         (let [result (d/q '[:find (pull ?b [:block/content
+                                             :block/line :block/source-line :block/source-mtime
+                                             :block/end-line :block/subtree-end-line
                                             :block/level
                                             :block/order
                                             {:block/page [:page/title]}])
@@ -826,11 +778,11 @@
                     (json-resp {:error "source file not found"
                                 :file (str target-dir "/" filename)} 404)
                     (let [lines (str/split-lines (slurp filepath))
-                          idx   (find-block-line-index lines cur-level order old-content)]
+                          idx   (indexed-block-line lines filepath block)]
                       (if (nil? idx)
                         (json-resp {:error "could not locate block in file"
                                     :block-id block-id :order order :level cur-level} 404)
-                        (let [end-idx (skip-children lines idx cur-level)
+                        (let [end-idx (:block/subtree-end-line block)
                               delta   (- new-level cur-level)
                               subtree (subvec lines idx end-idx)
                               changed-sub (mapv (fn [line]
