@@ -35,6 +35,15 @@
       (.exists journals-cand) journals-cand
       :else nil)))
 
+(defn- title->filename
+  "Encode a page title as a Logseq file-graph filename.
+   '/' encodes to '___' (Logseq's namespace encoding — the parser decodes
+   '___' back to '/'), then filesystem-illegal characters become '_'."
+  [title]
+  (-> (or title "")
+      (str/replace "/" "___")
+      (str/replace #"[\\:?*\"<>|\n\r]" "_")))
+
 (defn- index-and-record! [conn graph-dir filename]
   "Index a file and record its mtime so the inotify-triggered
    reindex-file-handler can detect whether the file changed since."
@@ -345,9 +354,7 @@
                         (str/replace "-" "_"))
               filename (if journal?
                          (str today ".md")
-                         (str (-> (or title "")
-                                  (str/replace #"[/\\:?*\"<>|]" "_"))
-                              ".md"))
+                         (str (title->filename title) ".md"))
               target-dir (if journal? "journals" "pages")
               dir-file  (java.io.File. graph-dir-file target-dir)
               filepath  (java.io.File. dir-file filename)]
@@ -385,12 +392,12 @@
           tmpl-name  (:template body)]
       (if (str/blank? title)
         (json-resp {:error "title is required"} 400)
-        (let [sanitized (str/replace title #"[/\\:?*\"<>|\n\r]" "_")
+        (let [sanitized (title->filename title)
               filename  (str sanitized ".md")
               graph-dir-file (java.io.File. graph-dir)
               filepath  (java.io.File. (java.io.File. graph-dir-file "pages") filename)]
           (if (.exists filepath)
-            (json-resp {:error "page already exists" :title sanitized} 409)
+            (json-resp {:error "page already exists" :title title} 409)
             ;; Build frontmatter
             (let [prop-lines (for [[k v] properties]
                                (str k ":: " v))
@@ -418,7 +425,7 @@
                   ;; Reindex
                   stats (index-and-record! conn graph-dir filename)]
               (json-resp {:status "ok"
-                          :title  sanitized
+                          :title  title
                           :file   (str "pages/" filename)
                           :stats  stats}))))))
     (catch Exception e
@@ -513,7 +520,7 @@
                 (let [graph-dir-file (java.io.File. graph-dir)
                       is-journal?   (re-matches #"\d{4}_\d{2}_\d{2}" page-title)
                       target-dir    (if is-journal? "journals" "pages")
-                      filename      (str (str/replace page-title #"[\"/\\:?*<>|]" "_") ".md")
+                      filename      (str (title->filename page-title) ".md")
                       filepath      (java.io.File. (java.io.File. graph-dir-file target-dir) filename)]
                   (if-not (.exists filepath)
                     (json-resp {:error "source file not found"
@@ -609,7 +616,7 @@
                 (let [graph-dir-file (java.io.File. graph-dir)
                       is-journal?   (re-matches #"\d{4}_\d{2}_\d{2}" page-title)
                       target-dir    (if is-journal? "journals" "pages")
-                      filename      (str (str/replace page-title #"[\"/\\:?*<>|]" "_") ".md")
+                      filename      (str (title->filename page-title) ".md")
                       filepath      (java.io.File. (java.io.File. graph-dir-file target-dir) filename)]
                   (if-not (.exists filepath)
                     (json-resp {:error "source file not found"
@@ -680,7 +687,7 @@
                 (let [graph-dir-file (java.io.File. graph-dir)
                       is-journal?   (re-matches #"\d{4}_\d{2}_\d{2}" page-title)
                       target-dir    (if is-journal? "journals" "pages")
-                      filename      (str (str/replace page-title #"[\"/\\:?*<>|]" "_") ".md")
+                      filename      (str (title->filename page-title) ".md")
                       filepath      (java.io.File. (java.io.File. graph-dir-file target-dir) filename)]
                   (if-not (.exists filepath)
                     (json-resp {:error "source file not found"
@@ -772,7 +779,7 @@
                 (let [graph-dir-file (java.io.File. graph-dir)
                       is-journal?   (re-matches #"\d{4}_\d{2}_\d{2}" page-title)
                       target-dir    (if is-journal? "journals" "pages")
-                      filename      (str (str/replace page-title #"[\"/\\:?*<>|]" "_") ".md")
+                      filename      (str (title->filename page-title) ".md")
                       filepath      (java.io.File. (java.io.File. graph-dir-file target-dir) filename)]
                   (if-not (.exists filepath)
                     (json-resp {:error "source file not found"
@@ -862,7 +869,7 @@
           remove? (boolean (:remove body))]
       (if (or (str/blank? title) (str/blank? pkey))
         (json-resp {:error "title and key are required"} 400)
-        (let [filename (str (str/replace title #"[/\\:?*\"<>|\n\r]" "_") ".md")
+        (let [filename (str (title->filename title) ".md")
               path     (resolve-file-path graph-dir filename)]
           (if (nil? path)
             (json-resp {:error "page not found" :title title} 404)

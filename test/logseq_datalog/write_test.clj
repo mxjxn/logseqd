@@ -109,3 +109,30 @@
         (is (= 200 (:status result)))
         (is (str/includes? (slurp file) "- Parent A\n\t- repeated\n"))
         (is (str/includes? (slurp file) "- Parent B\n\t\t- repeated\n\t\t\t- deep content"))))))
+
+(deftest namespaced-page-uses-logseq-filename-encoding
+  (with-graph
+    (fn [conn dir _file]
+      ;; create-page encodes '/' as '___' (Logseq's namespace encoding)
+      (let [result (api/create-page-handler conn dir (request {:title "proj/alpha"}))
+            body   (json/parse-string (:body result) true)]
+        (is (= 200 (:status result)))
+        (is (= "proj/alpha" (:title body)))
+        (is (.exists (io/file dir "pages" "proj___alpha.md")))
+        ;; append resolves the same encoded file instead of forking foo_bar.md
+        (let [r2 (api/append-handler conn dir (request {:title "proj/alpha" :content "child block"}))]
+          (is (= 200 (:status r2)))
+          (is (str/includes? (slurp (io/file dir "pages" "proj___alpha.md")) "child block")))
+        ;; update-block finds the source file through the encoding
+        (let [_      (indexer/index-file! conn dir "proj___alpha.md")
+              target (ffirst (d/q '[:find (pull ?b [* {:block/page [:page/title]}])
+                                    :where [?b :block/content "child block"]] @conn))
+              r3     (api/update-block-handler conn dir (request {:id (:block/id target) :content "edited in place"}))]
+          (is (some? target))
+          (is (= 200 (:status r3)))
+          (is (str/includes? (slurp (io/file dir "pages" "proj___alpha.md")) "edited in place")))
+        ;; a fresh index decodes the filename back to the namespaced title
+        (let [conn2 (d/create-conn schema/schema)]
+          (indexer/index-graph! conn2 dir)
+          (is (some #(= "proj/alpha" %)
+                    (map first (d/q '[:find ?t :where [_ :page/title ?t]] @conn2)))))))))
