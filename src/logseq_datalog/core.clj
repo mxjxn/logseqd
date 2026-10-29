@@ -27,4 +27,4 @@
                        (:pages stats) (:blocks stats) (:tags stats))))
     (println "Server ready on port" port)
     (jetty/run-jetty (api/make-app conn graph-dir)
-                     {:port port :join? true})))
+                     {:host "127.0.0.1" :port port :join? true})))
